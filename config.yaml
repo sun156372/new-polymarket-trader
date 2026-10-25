@@ -28,6 +28,14 @@ strategy:
   max_quote_staleness_s: 2.0
   max_slippage_cents: 2.0
 
+  # Print one detailed T-240 block per market.
+  debug: true
+
+  # DANGEROUS TEST SWITCH:
+  # True = bypass ALL thresholds at T-240 and buy the best available side.
+  # Use only to test open -> settle -> redeem -> balance, then set back to False.
+  force_trade_test: false
+
 exit:
   enable_take_profit: false
   take_profit_bid_price: 0.98
@@ -48,6 +56,7 @@ risk:
 state:
   path: "data/state.json"
   lock_path: "data/state.json.lock"
+  backup_corrupt: true
 
 redeem:
   enabled: true
@@ -63,5 +72,6 @@ redeem:
   max_attempts_before_alert: 5
 
 analytics:
-  print_interval_s: 10
+  heartbeat_s: 60
   log_path: "logs/v7.log"
+  print_interval_s: 60
