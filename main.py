@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """V7 entrypoint: paper or live, T-240 V6 strategy, crash recovery, auto-redeem.
 
-Logging policy:
-  * Analytics output is throttled inside utils.analytics.Analytics.
-  * main only calls analytics.maybe_print() once per loop.
-  * No analytics line is emitted per websocket/frame.
+Key behavior:
+  * paper/live executor is chosen from config.mode
+  * strategy evaluates at T-240 (plus a small 3s tolerance)
+  * force_trade_test=True bypasses the main data-readiness gate so the strategy
+    can force a trade even when up_mid_open / spot_open are missing
+  * analytics.maybe_print() is called once per loop and is internally throttled
+  * all per-market entries are reserved in state.json before order submission
 
 Run:
   python main.py --config config.yaml
@@ -283,11 +286,12 @@ class Runtime:
         self._capture_open(now)
         secs = (self.market.end_ms - now) / 1000.0
 
-        if (
-            not self.entry_done
-            and self.up_mid_open is not None
-            and self.spot_open is not None
-        ):
+        # force_trade_test must bypass the main's data-readiness gate.
+        ready = (
+            self.params.force_trade_test
+            or (self.up_mid_open is not None and self.spot_open is not None)
+        )
+        if not self.entry_done and ready:
             if self.params.entry_t_minus_s - 2.5 <= secs <= self.params.entry_t_minus_s + 0.5:
                 self.entry_done = True
                 sig = self.strategy.evaluate(
@@ -309,8 +313,7 @@ class Runtime:
                         self.binance.spot() or -1,
                     )
 
-        # IMPORTANT: maybe_print is internally throttled to 60s/heartbeat.
-        # It is safe to call once per loop; do NOT add print_status(force=True).
+        # Safe to call every loop: Analytics throttles to 60s / trade events.
         self.analytics.maybe_print()
 
 
@@ -366,4 +369,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
