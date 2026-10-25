@@ -1,0 +1,27 @@
+# secrets / runtime
+.env
+.env.*
+!.env.example
+data/state.json
+data/*.lock
+data/*.tmp
+data/*.corrupt.*
+logs/
+live_trading_confirm.txt
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# os
+.DS_Store
+Thumbs.db

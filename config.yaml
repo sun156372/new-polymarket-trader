@@ -1,0 +1,67 @@
+version: v7
+mode: "paper"          # paper | live
+
+polymarket:
+  gamma_url: "https://gamma-api.polymarket.com"
+  clob_host: "https://clob.polymarket.com"
+  clob_ws: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  chain_id: 137
+  # NEVER put the real key here. Placeholder only; main.py reads the env var.
+  private_key: "${POLYMARKET_PRIVATE_KEY}"
+  private_key_env: "POLYMARKET_PRIVATE_KEY"
+  funder_env: "POLYMARKET_FUNDER"
+  signature_type: 0
+  live_confirm_file: "live_trading_confirm.txt"
+  live_confirm_phrase: "I CONFIRM LIVE TRADING"
+
+binance:
+  ws_url: "wss://stream.binance.com:9443/ws/btcusdt@bookTicker"
+
+strategy:
+  entry_t_minus_s: 240
+  move_threshold: 0.20
+  mode: follow
+  imbalance_depth: 10
+  min_book_imbalance: 0.30
+  min_spot_move: 0.00020   # 2.0 bps
+  max_entry_price: 0.95
+  max_quote_staleness_s: 2.0
+  max_slippage_cents: 2.0
+
+exit:
+  enable_take_profit: false
+  take_profit_bid_price: 0.98
+  fallback: hold_to_settlement
+
+costs:
+  fee_model: "0.07 * p * (1-p)"
+  fee_coefficient: 0.07
+  fee_side: taker_only
+
+risk:
+  stake_usdc: 10.0
+  starting_balance_usdc: 1000.0
+  max_concurrent_positions: 2
+  daily_max_loss_usdc: 30.0
+  max_trades_per_day: 40
+
+state:
+  path: "data/state.json"
+  lock_path: "data/state.json.lock"
+
+redeem:
+  enabled: true
+  interval_s: 60
+  finality_buffer_s: 30
+  chain_id: 137
+  rpc_url_env: "POLYGON_RPC_URL"
+  private_key_env: "POLYMARKET_PRIVATE_KEY"
+  conditional_tokens: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+  collateral_usdc: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+  gas_multiplier: 1.25
+  receipt_timeout_s: 180
+  max_attempts_before_alert: 5
+
+analytics:
+  print_interval_s: 10
+  log_path: "logs/v7.log"
