@@ -7,13 +7,13 @@ Design rules:
   * Gamma discovery resolves the current btc-updown-5m market and token ids
   * REST fallback is forced whenever a book is not ready, so the strategy never
     silently starves on missing WebSocket book updates
+  * All token IDs are preserved as full strings; no silent truncation
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import math
 import time
 import urllib.parse
 import urllib.request
@@ -35,12 +35,13 @@ def now_ms() -> int:
 
 
 def _valid_token_id(value: Any) -> str | None:
-    """Normalize token ids from Gamma/WS/REST; keep the full string intact."""
+    """Normalize token ids from Gamma/WS/REST without truncating the full string."""
     if value is None:
         return None
     token = str(value).strip()
     if not token:
         return None
+    token = token.replace("\x00", "")
     if token.lower() in {"none", "null", "nan"}:
         return None
     if len(token) < 8:
@@ -48,7 +49,6 @@ def _valid_token_id(value: Any) -> str | None:
     return token
 
 
-# --------------------------------------------------------------------------- book
 def _levels(raw: Any) -> list[tuple[float, float]]:
     """Normalize Polymarket bids/asks into [(price, size)]."""
     out: list[tuple[float, float]] = []
@@ -136,7 +136,6 @@ class Market:
     neg_risk: bool = False
 
 
-# ---------------------------------------------------------------------- discovery
 class MarketDiscovery:
     """Gamma market lookup for btc-updown-5m-<start_epoch>."""
 
@@ -144,17 +143,16 @@ class MarketDiscovery:
         self.gamma_url = gamma_url.rstrip("/")
         self.timeout = timeout
 
-    def _get(self, url: str) -> Any:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "v7-sniper/1.0", "Accept": "application/json",
-        })
+    def _get_json(self, url: str) -> Any:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "v7-sniper/1.0",
+                "Accept": "application/json",
+            },
+        )
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return json.loads(r.read().decode("utf-8"))
-
-    @staticmethod
-    def slug_for(now: int) -> tuple[str, int]:
-        start_s = (now // 300_000) * 300
-        return f"btc-updown-5m-{start_s}", start_s * 1000
 
     @staticmethod
     def _json_list(v: Any) -> list:
@@ -175,18 +173,23 @@ class MarketDiscovery:
             return None
         return token
 
+    @staticmethod
+    def slug_for(now: int) -> tuple[str, int]:
+        start_s = (now // 300_000) * 300
+        return f"btc-updown-5m-{start_s}", start_s * 1000
+
     def fetch(self, slug: str, retries: int = 5) -> Market | None:
         url = f"{self.gamma_url}/markets?slug={urllib.parse.quote(slug)}"
         for attempt in range(retries):
             try:
-                data = self._get(url)
+                data = self._get_json(url)
                 if isinstance(data, dict):
                     data = [data]
                 if not data:
                     return None
                 m = data[0]
                 raw_tokens = self._json_list(m.get("clobTokenIds"))
-                tokens = []
+                tokens: list[str] = []
                 for raw in raw_tokens:
                     token = self._normalize_token(raw)
                     if token:
@@ -210,9 +213,8 @@ class MarketDiscovery:
         return None
 
     def resolve(self, slug: str) -> str | None:
-        """Return 'UP'/'DOWN' when closed, else None."""
         try:
-            data = self._get(f"{self.gamma_url}/markets?slug={urllib.parse.quote(slug)}")
+            data = self._get_json(f"{self.gamma_url}/markets?slug={urllib.parse.quote(slug)}")
             if isinstance(data, dict):
                 data = [data]
             if not data:
@@ -237,7 +239,6 @@ class MarketDiscovery:
         return None
 
 
-# -------------------------------------------------------------------------- feeds
 class PolymarketFeed:
     def __init__(self, ws_url: str, max_backoff: float = 30.0):
         if websockets is None:
@@ -255,7 +256,16 @@ class PolymarketFeed:
         token = _valid_token_id(token_id)
         if token is None:
             raise ValueError(f"invalid token_id: {token_id!r}")
-        return self.books.setdefault(token, Book(token))
+        return self.books.setdefault(token, Book(token_id=token))
+
+    def ensure_book_ready(self, token_id: str, *, timeout: float = 10.0) -> Book | None:
+        token = _valid_token_id(token_id)
+        if token is None:
+            return None
+        book = self.book(token)
+        if book.ready:
+            return book
+        return self.refresh_book_snapshot(token, timeout=timeout)
 
     def get_tick(self, token_id: str, *, force_refresh: bool = True, timeout: float = 10.0) -> Book | None:
         token = _valid_token_id(token_id)
@@ -263,6 +273,7 @@ class PolymarketFeed:
             return None
         book = self.book(token)
         if force_refresh and not book.ready:
+            print(f"[REST Fallback] Fetching book for token: {token}", flush=True)
             return self.refresh_book_snapshot(token, timeout=timeout)
         return book
 
@@ -271,12 +282,14 @@ class PolymarketFeed:
         if token is None:
             return None
         print(f"[REST Fallback] Fetching book for token: {token}", flush=True)
+
         url = f"https://clob.polymarket.com/book?token_id={urllib.parse.quote(token)}"
         headers = {
             "User-Agent": "v7-sniper/1.0",
             "Accept": "application/json",
             "Referer": "https://polymarket.com/",
         }
+
         try:
             resp = requests.get(url, timeout=timeout, headers=headers)
             resp.raise_for_status()
@@ -376,9 +389,11 @@ class PolymarketFeed:
             msg = json.loads(raw)
         except Exception:  # noqa: BLE001
             return
+
         for m in (msg if isinstance(msg, list) else [msg]):
             if not isinstance(m, dict):
                 continue
+
             et = str(m.get("event_type") or m.get("type") or m.get("eventType") or "").lower()
             token = str(
                 m.get("asset_id")
@@ -387,37 +402,51 @@ class PolymarketFeed:
                 or m.get("assetId")
                 or ""
             )
+
             if not token:
-                if "payload" in m and isinstance(m["payload"], dict):
+                payload = m.get("payload")
+                if isinstance(payload, dict):
                     token = str(
-                        m["payload"].get("asset_id")
-                        or m["payload"].get("token_id")
-                        or m["payload"].get("tokenId")
+                        payload.get("asset_id")
+                        or payload.get("token_id")
+                        or payload.get("tokenId")
                         or ""
                     )
+
             token = _valid_token_id(token)
             if not token:
                 continue
+
             b = self.book(token)
             ts = now_ms()
+
             if et in ("book", "book_update", "booksnapshot"):
                 bids = m.get("bids") or m.get("buys") or m.get("bid")
                 asks = m.get("asks") or m.get("sells") or m.get("ask")
+
                 if bids is None and "payload" in m and isinstance(m["payload"], dict):
                     bids = m["payload"].get("bids") or m["payload"].get("buys")
                 if asks is None and "payload" in m and isinstance(m["payload"], dict):
                     asks = m["payload"].get("asks") or m["payload"].get("sells")
+
                 if bids is not None or asks is not None:
                     b.set_book(bids or [], asks or [], ts)
+
             elif et == "price_change":
                 changes = m.get("changes") or m.get("price_changes") or []
                 if not changes and m.get("price") is not None:
                     changes = [{"price": m.get("price"), "size": m.get("size"), "side": m.get("side")}]
                 for c in changes:
                     try:
-                        b.apply_change(float(c["price"]), float(c.get("size", 0)), str(c.get("side", "BUY")), ts)
+                        b.apply_change(
+                            float(c["price"]),
+                            float(c.get("size", 0)),
+                            str(c.get("side", "BUY")),
+                            ts,
+                        )
                     except (KeyError, TypeError, ValueError):
                         continue
+
             elif et in ("best_bid_ask", "tick_size_change"):
                 b.last_update_ms = ts
 
@@ -470,24 +499,24 @@ class BinanceFeed:
         return self.price
 
 
-# ---------------------------------------------------------------------------
-# compatibility helpers for direct strategy-layer fallback
-# ---------------------------------------------------------------------------
-
 def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout: float = 10.0) -> bool:
     """Direct synchronous REST refresh for a single token book."""
     if book.ready:
         return True
+
     token_id = _valid_token_id(book.token_id)
     if not token_id:
         return False
+
     print(f"[REST Fallback] Fetching book for token: {token_id}", flush=True)
+
     url = f"https://clob.polymarket.com/book?token_id={urllib.parse.quote(token_id)}"
     headers = {
         "User-Agent": "v7-sniper/1.0",
         "Accept": "application/json",
         "Referer": "https://polymarket.com/",
     }
+
     try:
         resp = requests.get(url, timeout=timeout, headers=headers)
         resp.raise_for_status()
@@ -509,6 +538,7 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
 
     bids = data.get("bids") or data.get("buys") or data.get("bid")
     asks = data.get("asks") or data.get("sells") or data.get("ask")
+
     if bids is None or asks is None:
         print(f"[REST Fallback] No bids/asks in payload for token={token_id}: {data}", flush=True)
         return False
