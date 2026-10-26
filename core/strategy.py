@@ -107,22 +107,20 @@ def _bps(spot_move: float) -> float:
 
 def _gate(reason: str) -> None:
     """Terminal-visible gate result; independent of logging config."""
-    print(f"[Gate拦截] reason={reason}", flush=True)
+    print(f"[Gate拦截] 原因={reason}", flush=True)
 
 
 class V6Strategy:
     def __init__(self, params: V6Params):
         self.p = params
 
-    # ------------------------------------------------------------------ debug
     def _debug(self, *, market: Market, secs: float, up_book: Book, down_book: Book,
                up_mid_open: float | None, up_mid: float | None,
                spot_open: float | None, spot_now: float | None,
                spot_move: float | None, imbalance: float | None,
                move: float | None, side: str, ask: float | None,
                reason: str) -> None:
-        # TEST MODE: force a terminal line for EVERY rejection, regardless of
-        # config.logging level or strategy.debug. This is intentionally loud.
+        """Always emit terminal diagnostics; never suppress them behind a debug flag."""
         bid_vol5 = _volume(up_book, "bid", 5)
         ask_vol5 = _volume(up_book, "ask", 5)
         dbid_vol5 = _volume(down_book, "bid", 5)
@@ -153,9 +151,6 @@ class V6Strategy:
             f" ask={ask}",
             flush=True,
         )
-
-        if not self.p.debug:
-            return
 
         LOG.info(
             "[Debug] market=%s secs_to_close=%.2f reason=%s side=%s",
@@ -190,19 +185,16 @@ class V6Strategy:
             sm_bps, f"{ask:.6f}" if ask is not None else "None",
         )
 
-    # ---------------------------------------------------------------- evaluate
     def evaluate(self, *, market: Market, up_book: Book, down_book: Book,
                  up_mid_open: float | None, spot_open: float | None,
                  spot_now: float | None, now_ms: int) -> Signal | None:
         p = self.p
         secs = (market.end_ms - now_ms) / 1000.0
 
-        # Only the T-240 window is a decision point.
         if not (p.entry_t_minus_s - 2.5 <= secs <= p.entry_t_minus_s + 0.5):
             _gate("NOT_T240")
             return None
 
-        # Diagnostics run in the window even when data is missing.
         if not up_book.ready and not p.force_trade_test:
             self._debug(
                 market=market, secs=secs, up_book=up_book, down_book=down_book,
@@ -231,9 +223,7 @@ class V6Strategy:
         ask = book.best_ask
         bid = book.best_bid
 
-        # ---------------------------------------------------------- force test
         if p.force_trade_test:
-            # Bypass every threshold, but never invent a price.
             if ask is None or not (0 < ask < 1):
                 alt_side = "DOWN" if side == "UP" else "UP"
                 alt = down_book if alt_side == "DOWN" else up_book
@@ -266,7 +256,6 @@ class V6Strategy:
                 spread=max(0.0, ask - bid), secs_to_close=secs, reason="force_test",
             )
 
-        # ---------------------------------------------------------- normal path
         if up_mid_open is None or up_mid is None:
             self._debug(
                 market=market, secs=secs, up_book=up_book, down_book=down_book,

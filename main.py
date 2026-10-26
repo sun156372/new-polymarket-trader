@@ -102,7 +102,6 @@ class Runtime:
         self.trade_id: str | None = None
         self.stop = asyncio.Event()
 
-    # ------------------------------------------------------------------ helpers
     async def _roll_market(self, now: int) -> bool:
         slug, _ = MarketDiscovery.slug_for(now)
         if self.market and self.market.slug == slug:
@@ -260,7 +259,6 @@ class Runtime:
             self.paper_fill = None
             self.trade_id = None
 
-        # recovered paper position after restart
         for p in self.state.active_positions():
             if p.market_slug == self.market.slug and p.status == "open":
                 won = p.side.upper() == winner
@@ -295,8 +293,6 @@ class Runtime:
         self._capture_open(now)
         secs = (self.market.end_ms - now) / 1000.0
 
-        # Always enter the strategy at T-240. evaluate() itself decides whether
-        # the data is sufficient and prints the exact rejection reason.
         in_window = (
             self.params.entry_t_minus_s - 2.5
             <= secs
@@ -328,7 +324,6 @@ class Runtime:
                 now_ms=now,
             )
             if sig:
-                # Mark before the await so a slow executor cannot double-enter.
                 self.entry_done = True
                 await self._enter(sig)
             else:
@@ -339,7 +334,6 @@ class Runtime:
                     flush=True,
                 )
 
-        # Safe to call every loop: Analytics throttles to 60s / trade events.
         self.analytics.maybe_print()
 
 

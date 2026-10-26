@@ -7,6 +7,7 @@ exact confirmation phrase. The private key is read from os.getenv only.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,15 +55,36 @@ class PaperExecutor(BaseExecutor):
         stake = min(float(stake_usdc), self.balance)
         if stake <= 0:
             raise RuntimeError("paper balance exhausted")
+
         fill_price = min(0.999, signal.ask + self.slippage)
         shares = stake / fill_price
+
+        if not math.isfinite(shares) or shares <= 0:
+            print("[Error] 仓位计算为0，放弃下单", flush=True)
+            raise RuntimeError("paper order size zero")
+
+        if shares < 1.0:
+            if stake >= fill_price * 1.0:
+                shares = 1.0
+            else:
+                print("[Error] 仓位计算为0，放弃下单", flush=True)
+                raise RuntimeError("paper order size below minimum trade unit")
+
         fee = shares * self.fee_coefficient * fill_price * (1 - fill_price)
         cost = shares * fill_price + fee
+
         if cost > self.balance:
-            shares = max(0.0, (self.balance / (fill_price * (1 + self.fee_coefficient *
-                                                             (1 - fill_price)))))
+            affordable = self.balance / (fill_price * (1 + self.fee_coefficient * (1 - fill_price)))
+            if not math.isfinite(affordable) or affordable <= 0:
+                print("[Error] 仓位计算为0，放弃下单", flush=True)
+                raise RuntimeError("paper balance cannot cover order")
+            shares = affordable
+            if shares < 1.0:
+                print("[Error] 仓位计算为0，放弃下单", flush=True)
+                raise RuntimeError("paper order size below minimum trade unit")
             fee = shares * self.fee_coefficient * fill_price * (1 - fill_price)
             cost = shares * fill_price + fee
+
         self.balance -= cost
         fill = Fill(
             market_slug=signal.market.slug, side=signal.side,
