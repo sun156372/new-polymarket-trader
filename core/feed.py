@@ -95,7 +95,7 @@ class Book:
     def set_book(self, bids: Any, asks: Any, ts_ms: int | None = None) -> None:
         self.bids = {p: s for p, s in _levels(bids)}
         self.asks = {p: s for p, s in _levels(asks)}
-        # 强制使用本地接收时间，避免 WS/REST 返回老时间戳导致 quote stale
+        # Always stamp with local receive time so stale guards use fresh clock.
         self.last_update_ms = int(time.time() * 1000)
         if ts_ms is not None:
             self.last_update_ms = max(self.last_update_ms, int(ts_ms))
@@ -106,7 +106,6 @@ class Book:
             book.pop(price, None)
         elif 0 < price < 1:
             book[price] = size
-        # 强制刷新本地时间戳，确保新消息一定算最新
         self.last_update_ms = int(time.time() * 1000)
         if ts_ms is not None:
             self.last_update_ms = max(self.last_update_ms, int(ts_ms))
@@ -116,7 +115,6 @@ class Book:
             self.bids[bid] = self.bids.get(bid, 0.0) or 1e-9
         if ask is not None and 0 < ask < 1:
             self.asks[ask] = self.asks.get(ask, 0.0) or 1e-9
-        # 强制刷新本地时间戳，确保新消息一定算最新
         self.last_update_ms = int(time.time() * 1000)
         if ts_ms is not None:
             self.last_update_ms = max(self.last_update_ms, int(ts_ms))
@@ -318,25 +316,43 @@ class PolymarketFeed:
             print(f"[REST Fallback] Unexpected response shape for token={token}: {type(data).__name__}", flush=True)
             return None
 
-        bids = data.get("bids") or data.get("buys") or data.get("bid")
-        asks = data.get("asks") or data.get("sells") or data.get("ask")
-
+        # Explicit None checks only: never use `or` here.
+        bids = data.get("bids")
+        if bids is None:
+            bids = data.get("buys")
+        if bids is None:
+            bids = data.get("bid")
         if bids is None and "book" in data and isinstance(data["book"], dict):
-            bids = data["book"].get("bids") or data["book"].get("buys")
-        if asks is None and "book" in data and isinstance(data["book"], dict):
-            asks = data["book"].get("asks") or data["book"].get("sells")
+            book_obj = data["book"]
+            bids = book_obj.get("bids")
+            if bids is None:
+                bids = book_obj.get("buys")
+            if bids is None:
+                bids = book_obj.get("bid")
+        if bids is None:
+            bids = []
 
-        if bids is None or asks is None:
-            print(f"[REST Fallback] No bids/asks in payload for token={token}: {data}", flush=True)
-            return None
+        asks = data.get("asks")
+        if asks is None:
+            asks = data.get("sells")
+        if asks is None:
+            asks = data.get("ask")
+        if asks is None and "book" in data and isinstance(data["book"], dict):
+            book_obj = data["book"]
+            asks = book_obj.get("asks")
+            if asks is None:
+                asks = book_obj.get("sells")
+            if asks is None:
+                asks = book_obj.get("ask")
+        if asks is None:
+            asks = []
 
         book = self.book(token)
         book.set_book(bids, asks, now_ms())
-        # 强制刷新本地 book 时间戳，避免 REST 成功但仍被判为 stale
         book.last_update_ms = int(time.time() * 1000)
+
         print(
-            f"[REST Fallback] Refreshed token={token} bids={len(book.bids)} asks={len(book.asks)} "
-            f"best_bid={book.best_bid} best_ask={book.best_ask}",
+            f"[REST] Refreshed token={token} bids={len(bids)} asks={len(asks)}",
             flush=True,
         )
         return book
@@ -432,17 +448,19 @@ class PolymarketFeed:
             ts = now_ms()
 
             if et in ("book", "book_update", "booksnapshot"):
-                bids = m.get("bids") or m.get("buys") or m.get("bid")
-                asks = m.get("asks") or m.get("sells") or m.get("ask")
-
-                if bids is None and "payload" in m and isinstance(m["payload"], dict):
-                    bids = m["payload"].get("bids") or m["payload"].get("buys")
-                if asks is None and "payload" in m and isinstance(m["payload"], dict):
-                    asks = m["payload"].get("asks") or m["payload"].get("sells")
+                bids = m.get("bids")
+                if bids is None:
+                    bids = m.get("buys")
+                if bids is None:
+                    bids = m.get("bid")
+                asks = m.get("asks")
+                if asks is None:
+                    asks = m.get("sells")
+                if asks is None:
+                    asks = m.get("ask")
 
                 if bids is not None or asks is not None:
-                    b.set_book(bids or [], asks or [], ts)
-                    # 强制刷新本地时间戳，确保 WS 更新也算“刚收到”
+                    b.set_book(bids if bids is not None else [], asks if asks is not None else [], ts)
                     b.last_update_ms = int(time.time() * 1000)
 
             elif et == "price_change":
@@ -457,7 +475,6 @@ class PolymarketFeed:
                             str(c.get("side", "BUY")),
                             ts,
                         )
-                        # 强制刷新本地时间戳，确保 price change 也算 fresh
                         b.last_update_ms = int(time.time() * 1000)
                     except (KeyError, TypeError, ValueError):
                         continue
@@ -554,19 +571,42 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
         print(f"[REST Fallback] Unexpected response shape for token={token_id}: {type(data).__name__}", flush=True)
         return False
 
-    bids = data.get("bids") or data.get("buys") or data.get("bid")
-    asks = data.get("asks") or data.get("sells") or data.get("ask")
+    # Explicit None checks only: never use `or` here.
+    bids = data.get("bids")
+    if bids is None:
+        bids = data.get("buys")
+    if bids is None:
+        bids = data.get("bid")
+    if bids is None and "book" in data and isinstance(data["book"], dict):
+        book_obj = data["book"]
+        bids = book_obj.get("bids")
+        if bids is None:
+            bids = book_obj.get("buys")
+        if bids is None:
+            bids = book_obj.get("bid")
+    if bids is None:
+        bids = []
 
-    if bids is None or asks is None:
-        print(f"[REST Fallback] No bids/asks in payload for token={token_id}: {data}", flush=True)
-        return False
+    asks = data.get("asks")
+    if asks is None:
+        asks = data.get("sells")
+    if asks is None:
+        asks = data.get("ask")
+    if asks is None and "book" in data and isinstance(data["book"], dict):
+        book_obj = data["book"]
+        asks = book_obj.get("asks")
+        if asks is None:
+            asks = book_obj.get("sells")
+        if asks is None:
+            asks = book_obj.get("ask")
+    if asks is None:
+        asks = []
 
     book.set_book(bids, asks, now_ms())
-    # 强制刷新本地时间戳，避免 REST 成功但仍被判为 stale
     book.last_update_ms = int(time.time() * 1000)
+
     print(
-        f"[REST Fallback] Refreshed token={token_id} bids={len(book.bids)} asks={len(book.asks)} "
-        f"best_bid={book.best_bid} best_ask={book.best_ask}",
+        f"[REST] Refreshed token={token_id} bids={len(bids)} asks={len(asks)}",
         flush=True,
     )
     return book.ready
