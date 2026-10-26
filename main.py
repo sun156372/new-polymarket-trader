@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""V7 entrypoint: paper or live, T-240 V6 strategy, crash recovery, auto-redeem.
-
-Key behavior:
-  * paper/live executor is chosen from config.mode
-  * strategy evaluates at T-240 (plus a small 3s tolerance)
-  * force_trade_test=True bypasses the main data-readiness gate so the strategy
-    can force a trade even when up_mid_open / spot_open are missing
-  * analytics.maybe_print() is called once per loop and is internally throttled
-  * all per-market entries are reserved in state.json before order submission
-
-Run:
-  python main.py --config config.yaml
-"""
+"""V7 entrypoint: paper or live, T-240 V6 strategy, crash recovery, auto-redeem."""
 from __future__ import annotations
 
 import argparse
@@ -30,7 +18,7 @@ ROOT = Path(__file__).resolve().parent
 try:
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
-except Exception:  # noqa: BLE001
+except Exception:
     pass
 
 from core.executor import Fill, build_executor
@@ -128,7 +116,6 @@ class Runtime:
         return True
 
     def reconcile_recovered_paper(self) -> None:
-        """Restart in paper mode: deduct open positions' cost from paper equity."""
         if self.mode != "paper":
             return
         for p in self.state.active_positions():
@@ -336,47 +323,49 @@ class Runtime:
 
         self.analytics.maybe_print()
 
-    async def amain(config_path: str) -> int:
-        cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
-        setup_logging(cfg)
-        LOG.info("V7 starting mode=%s config=%s", cfg.get("mode"), config_path)
 
-        runtime = Runtime(cfg)
-        runtime.state.recover()
-        runtime.reconcile_recovered_paper()
+# 🚀 修复：把 amain 移出 Runtime 类，作为全局异步函数
+async def amain(config_path: str) -> int:
+    cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+    setup_logging(cfg)
+    LOG.info("V7 starting mode=%s config=%s", cfg.get("mode"), config_path)
 
-        if runtime.mode == "live" and cfg.get("redeem", {}).get("enabled", True):
-            engine = RedeemEngine(
-                runtime.state,
-                interval_s=int(cfg.get("redeem", {}).get("interval_s", 60)),
-                finality_buffer_s=int(
-                    cfg.get("redeem", {}).get("finality_buffer_s", 30)
-                ),
-            )
-            asyncio.create_task(engine.run_forever(runtime.stop), name="redeem-engine")
+    runtime = Runtime(cfg)
+    runtime.state.recover()
+    runtime.reconcile_recovered_paper()
 
-        await runtime.pm.start()
-        await runtime.binance.start()
+    if runtime.mode == "live" and cfg.get("redeem", {}).get("enabled", True):
+        engine = RedeemEngine(
+            runtime.state,
+            interval_s=int(cfg.get("redeem", {}).get("interval_s", 60)),
+            finality_buffer_s=int(
+                cfg.get("redeem", {}).get("finality_buffer_s", 30)
+            ),
+        )
+        asyncio.create_task(engine.run_forever(runtime.stop), name="redeem-engine")
 
-        def _stop(*_):
-            LOG.info("shutdown requested")
-            runtime.stop.set()
+    await runtime.pm.start()
+    await runtime.binance.start()
 
-        signal.signal(signal.SIGINT, _stop)
-        signal.signal(signal.SIGTERM, _stop)
+    def _stop(*_):
+        LOG.info("shutdown requested")
+        runtime.stop.set()
 
-        while not runtime.stop.is_set():
-            try:
-                await runtime.step()
-            except Exception:  # noqa: BLE001
-                LOG.exception("main loop step failed; continuing in 5s")
-                await asyncio.sleep(5)
-            await asyncio.sleep(0.25)
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
 
-        await runtime.pm.stop()
-        await runtime.binance.stop()
-        LOG.info("V7 stopped")
-        return 0
+    while not runtime.stop.is_set():
+        try:
+            await runtime.step()
+        except Exception:
+            LOG.exception("main loop step failed; continuing in 5s")
+            await asyncio.sleep(5)
+        await asyncio.sleep(0.25)
+
+    await runtime.pm.stop()
+    await runtime.binance.stop()
+    LOG.info("V7 stopped")
+    return 0
 
 
 def main() -> int:
