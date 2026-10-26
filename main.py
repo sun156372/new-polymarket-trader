@@ -378,11 +378,13 @@ class Runtime:
         LOG.info("V7 stopped")
         return 0
 
-    def main() -> int:
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--config", default="config.yaml")
-        args = ap.parse_args()
-        return asyncio.run(amain(args.config))
 
-    if __name__ == "__main__":
-        raise SystemExit(main())
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config.yaml")
+    args = ap.parse_args()
+    return asyncio.run(amain(args.config))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
