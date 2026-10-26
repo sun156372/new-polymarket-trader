@@ -216,6 +216,15 @@ class Runtime:
                 self.paper_fill = fill
             self.trade_id = trade_id
             self.analytics.note_position_change()
+            print(
+                f"[{'Paper' if self.mode == 'paper' else 'Live'}] 买入"
+                f" market={sig.market.slug}"
+                f" side={sig.side}"
+                f" ask={sig.ask:.4f}"
+                f" fill={fill.entry_price:.4f}"
+                f" shares={fill.shares:.4f}",
+                flush=True,
+            )
             LOG.info(
                 "[Entry] %s %s ask=%.4f fill=%.4f shares=%.4f",
                 sig.market.slug,
@@ -286,32 +295,49 @@ class Runtime:
         self._capture_open(now)
         secs = (self.market.end_ms - now) / 1000.0
 
-        # force_trade_test must bypass the main's data-readiness gate.
-        ready = (
-            self.params.force_trade_test
-            or (self.up_mid_open is not None and self.spot_open is not None)
+        # Always enter the strategy at T-240. evaluate() itself decides whether
+        # the data is sufficient and prints the exact rejection reason.
+        in_window = (
+            self.params.entry_t_minus_s - 2.5
+            <= secs
+            <= self.params.entry_t_minus_s + 0.5
         )
-        if not self.entry_done and ready:
-            if self.params.entry_t_minus_s - 2.5 <= secs <= self.params.entry_t_minus_s + 0.5:
+        if not self.entry_done and in_window:
+            up = self.pm.book(self.market.up_token)
+            down = self.pm.book(self.market.down_token)
+            print(
+                "[Main] 正在执行策略判断..."
+                f" market={self.market.slug}"
+                f" secs={secs:.2f}"
+                f" up_mid_open={self.up_mid_open}"
+                f" spot_open={self.spot_open}"
+                f" up_ready={up.ready}"
+                f" down_ready={down.ready}"
+                f" up_best_bid={up.best_bid}"
+                f" up_best_ask={up.best_ask}"
+                f" force={self.params.force_trade_test}",
+                flush=True,
+            )
+            sig = self.strategy.evaluate(
+                market=self.market,
+                up_book=up,
+                down_book=down,
+                up_mid_open=self.up_mid_open,
+                spot_open=self.spot_open,
+                spot_now=self.binance.spot(),
+                now_ms=now,
+            )
+            if sig:
+                # Mark before the await so a slow executor cannot double-enter.
                 self.entry_done = True
-                sig = self.strategy.evaluate(
-                    market=self.market,
-                    up_book=self.pm.book(self.market.up_token),
-                    down_book=self.pm.book(self.market.down_token),
-                    up_mid_open=self.up_mid_open,
-                    spot_open=self.spot_open,
-                    spot_now=self.binance.spot(),
-                    now_ms=now,
+                await self._enter(sig)
+            else:
+                print(
+                    f"[Main] strategy returned None market={self.market.slug}"
+                    f" secs={secs:.2f} up_mid={up.mid}"
+                    f" spot={self.binance.spot()}",
+                    flush=True,
                 )
-                if sig:
-                    await self._enter(sig)
-                else:
-                    LOG.info(
-                        "[Signal] none secs=%.1f up_mid=%.4f spot=%.2f",
-                        secs,
-                        self.pm.book(self.market.up_token).mid or -1,
-                        self.binance.spot() or -1,
-                    )
 
         # Safe to call every loop: Analytics throttles to 60s / trade events.
         self.analytics.maybe_print()
