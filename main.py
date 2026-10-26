@@ -51,6 +51,8 @@ class Runtime:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.params = V6Params.from_config(cfg)
+        print(f"Loaded force_trade_test={self.params.force_trade_test}", flush=True)
+        print(f"Loaded strategy params={cfg.get('strategy', {})}", flush=True)
         self.strategy = V6Strategy(self.params)
         self.mode = str(cfg.get("mode", "paper")).lower()
 
@@ -331,6 +333,10 @@ async def amain(config_path: str) -> int:
     LOG.info("V7 starting mode=%s config=%s", cfg.get("mode"), config_path)
 
     runtime = Runtime(cfg)
+    params = runtime.params
+    print(f"Loaded force_trade_test={params.force_trade_test}", flush=True)
+    print(f"Loaded full config strategy={cfg.get('strategy', {})}", flush=True)
+
     runtime.state.recover()
     runtime.reconcile_recovered_paper()
 
