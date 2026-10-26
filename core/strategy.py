@@ -46,19 +46,20 @@ class V6Params:
 
     @classmethod
     def from_config(cls, cfg: dict) -> "V6Params":
-        s = cfg.get("strategy", {})
+        strategy_cfg = cfg.get("strategy", {}) if isinstance(cfg.get("strategy", {}), dict) else {}
+        value = strategy_cfg.get("force_trade_test", cfg.get("force_trade_test", False))
         return cls(
-            entry_t_minus_s=float(s.get("entry_t_minus_s", 240.0)),
-            move_threshold=float(s.get("move_threshold", 0.20)),
-            mode=str(s.get("mode", "follow")),
-            imbalance_depth=int(s.get("imbalance_depth", 10)),
-            min_book_imbalance=float(s.get("min_book_imbalance", 0.30)),
-            min_spot_move=float(s.get("min_spot_move", 0.00020)),
-            max_entry_price=float(s.get("max_entry_price", 0.95)),
-            max_quote_staleness_s=float(s.get("max_quote_staleness_s", 2.0)),
-            max_slippage_cents=float(s.get("max_slippage_cents", 2.0)),
-            debug=bool(s.get("debug", True)),
-            force_trade_test=bool(s.get("force_trade_test", False)),
+            entry_t_minus_s=float(strategy_cfg.get("entry_t_minus_s", 240.0)),
+            move_threshold=float(strategy_cfg.get("move_threshold", 0.20)),
+            mode=str(strategy_cfg.get("mode", "follow")),
+            imbalance_depth=int(strategy_cfg.get("imbalance_depth", 10)),
+            min_book_imbalance=float(strategy_cfg.get("min_book_imbalance", 0.30)),
+            min_spot_move=float(strategy_cfg.get("min_spot_move", 0.00020)),
+            max_entry_price=float(strategy_cfg.get("max_entry_price", 0.95)),
+            max_quote_staleness_s=float(strategy_cfg.get("max_quote_staleness_s", 2.0)),
+            max_slippage_cents=float(strategy_cfg.get("max_slippage_cents", 2.0)),
+            debug=bool(strategy_cfg.get("debug", True)),
+            force_trade_test=bool(value),
         )
 
 
@@ -169,6 +170,7 @@ class V6Strategy:
         if secs <= 0:
             return None
 
+        # 强制测试模式：最优先，忽略 stale 检查
         if self.p.force_trade_test:
             up_ask = up_book.best_ask
             down_ask = down_book.best_ask
@@ -183,12 +185,17 @@ class V6Strategy:
             else:
                 side = "DOWN"
                 ask = down_ask
+
             if ask is None or ask <= 0:
                 return None
-            if now_ms - max(up_book.last_update_ms, down_book.last_update_ms) > self.p.max_quote_staleness_s * 1000:
-                return None
+
             bid = up_book.best_bid if side == "UP" else down_book.best_bid
             spread = (ask - bid) if bid is not None else 0.0
+            print(
+                f"[Strategy][ForceTrade] market={market.slug} side={side} "
+                f"ask={ask} bid={bid} spread={spread} secs={secs:.2f}",
+                flush=True,
+            )
             return Signal(
                 market=market,
                 side=side,
