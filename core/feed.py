@@ -1,9 +1,12 @@
+#!/usr/bin/env python3
 """Market data layer: Polymarket CLOB WebSocket + Binance bookTicker.
 
 Design rules:
   * every book carries a local receive timestamp; strategy refuses stale books
   * reconnect loops never kill the process
   * Gamma discovery resolves the current btc-updown-5m market and token ids
+  * REST fallback is forced whenever a book is not ready, so the strategy never
+    silently starves on missing WebSocket book updates
 """
 from __future__ import annotations
 
@@ -17,6 +20,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+import requests
+
 try:
     import websockets
 except Exception:  # noqa: BLE001
@@ -27,6 +32,20 @@ LOG = logging.getLogger("v7.feed")
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _valid_token_id(value: Any) -> str | None:
+    """Normalize token ids from Gamma/WS/REST; keep the full string intact."""
+    if value is None:
+        return None
+    token = str(value).strip()
+    if not token:
+        return None
+    if token.lower() in {"none", "null", "nan"}:
+        return None
+    if len(token) < 8:
+        return None
+    return token
 
 
 # --------------------------------------------------------------------------- book
@@ -149,6 +168,13 @@ class MarketDiscovery:
                 return []
         return []
 
+    @staticmethod
+    def _normalize_token(raw: Any) -> str | None:
+        token = _valid_token_id(raw)
+        if token is None:
+            return None
+        return token
+
     def fetch(self, slug: str, retries: int = 5) -> Market | None:
         url = f"{self.gamma_url}/markets?slug={urllib.parse.quote(slug)}"
         for attempt in range(retries):
@@ -159,7 +185,12 @@ class MarketDiscovery:
                 if not data:
                     return None
                 m = data[0]
-                tokens = self._json_list(m.get("clobTokenIds"))
+                raw_tokens = self._json_list(m.get("clobTokenIds"))
+                tokens = []
+                for raw in raw_tokens:
+                    token = self._normalize_token(raw)
+                    if token:
+                        tokens.append(token)
                 if len(tokens) < 2:
                     return None
                 start_ms = int(slug.rsplit("-", 1)[-1]) * 1000
@@ -221,10 +252,73 @@ class PolymarketFeed:
         self._raw_debug_count = 0
 
     def book(self, token_id: str) -> Book:
-        return self.books.setdefault(token_id, Book(token_id))
+        token = _valid_token_id(token_id)
+        if token is None:
+            raise ValueError(f"invalid token_id: {token_id!r}")
+        return self.books.setdefault(token, Book(token))
+
+    def get_tick(self, token_id: str, *, force_refresh: bool = True, timeout: float = 10.0) -> Book | None:
+        token = _valid_token_id(token_id)
+        if token is None:
+            return None
+        book = self.book(token)
+        if force_refresh and not book.ready:
+            return self.refresh_book_snapshot(token, timeout=timeout)
+        return book
+
+    def refresh_book_snapshot(self, token_id: str, timeout: float = 10.0) -> Book | None:
+        token = _valid_token_id(token_id)
+        if token is None:
+            return None
+        print(f"[REST Fallback] Fetching book for token: {token}", flush=True)
+        url = f"https://clob.polymarket.com/book?token_id={urllib.parse.quote(token)}"
+        headers = {
+            "User-Agent": "v7-sniper/1.0",
+            "Accept": "application/json",
+            "Referer": "https://polymarket.com/",
+        }
+        try:
+            resp = requests.get(url, timeout=timeout, headers=headers)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[REST Fallback] Failed for token={token} url={url} error={exc}", flush=True)
+            return None
+
+        data = payload
+        if isinstance(data, dict):
+            if "book" in data and isinstance(data["book"], dict):
+                data = data["book"]
+            elif "data" in data and isinstance(data["data"], dict):
+                data = data["data"]
+
+        if not isinstance(data, dict):
+            print(f"[REST Fallback] Unexpected response shape for token={token}: {type(data).__name__}", flush=True)
+            return None
+
+        bids = data.get("bids") or data.get("buys") or data.get("bid")
+        asks = data.get("asks") or data.get("sells") or data.get("ask")
+
+        if bids is None and "book" in data and isinstance(data["book"], dict):
+            bids = data["book"].get("bids") or data["book"].get("buys")
+        if asks is None and "book" in data and isinstance(data["book"], dict):
+            asks = data["book"].get("asks") or data["book"].get("sells")
+
+        if bids is None or asks is None:
+            print(f"[REST Fallback] No bids/asks in payload for token={token}: {data}", flush=True)
+            return None
+
+        book = self.book(token)
+        book.set_book(bids, asks, now_ms())
+        print(
+            f"[REST Fallback] Refreshed token={token} bids={len(book.bids)} asks={len(book.asks)} "
+            f"best_bid={book.best_bid} best_ask={book.best_ask}",
+            flush=True,
+        )
+        return book
 
     async def subscribe(self, tokens: Iterable[str]) -> None:
-        new = {str(t) for t in tokens if t}
+        new = {str(t).strip() for t in tokens if t and _valid_token_id(t)}
         if new == self.tokens:
             return
         self.tokens = new
@@ -253,58 +347,6 @@ class PolymarketFeed:
         preview = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
         print(f"[WS raw #{self._raw_debug_count + 1}] {preview[:2000]}", flush=True)
         self._raw_debug_count += 1
-
-    def fetch_rest_book(self, token_id: str, timeout: float = 10.0) -> Book | None:
-        token_id = str(token_id).strip()
-        if not token_id:
-            return None
-        url = f"https://clob.polymarket.com/book?token_id={urllib.parse.quote(token_id)}"
-        print(f"[REST fallback] GET {url}", flush=True)
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "v7-sniper/1.0",
-                "Accept": "application/json",
-                "Referer": "https://polymarket.com/",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                payload = r.read().decode("utf-8", errors="replace")
-                print(f"[REST fallback] URL={url} response={payload[:2000]}", flush=True)
-                data = json.loads(payload)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[REST fallback] FAIL URL={url} error={exc}", flush=True)
-            return None
-
-        if isinstance(data, dict):
-            if "book" in data and isinstance(data["book"], dict):
-                data = data["book"]
-            elif "data" in data and isinstance(data["data"], dict):
-                data = data["data"]
-
-        if not isinstance(data, dict):
-            print(f"[REST fallback] unexpected format for token_id={token_id}: {type(data).__name__}", flush=True)
-            return None
-
-        book = self.book(token_id)
-        bids = data.get("bids") or data.get("buys") or data.get("bid")
-        asks = data.get("asks") or data.get("sells") or data.get("ask")
-        if bids is None and "book" in data and isinstance(data["book"], dict):
-            bids = data["book"].get("bids") or data["book"].get("buys")
-        if asks is None and "book" in data and isinstance(data["book"], dict):
-            asks = data["book"].get("asks") or data["book"].get("sells")
-        if bids is None or asks is None:
-            print(f"[REST fallback] no bids/asks in payload for token_id={token_id}: {data}", flush=True)
-            return None
-
-        book.set_book(bids, asks, now_ms())
-        print(
-            f"[REST fallback] refreshed token={token_id} bids={len(book.bids)} asks={len(book.asks)} "
-            f"best_bid={book.best_bid} best_ask={book.best_ask}",
-            flush=True,
-        )
-        return book
 
     async def _run(self) -> None:
         backoff = 1.0
@@ -353,6 +395,7 @@ class PolymarketFeed:
                         or m["payload"].get("tokenId")
                         or ""
                     )
+            token = _valid_token_id(token)
             if not token:
                 continue
             b = self.book(token)
@@ -369,12 +412,10 @@ class PolymarketFeed:
             elif et == "price_change":
                 changes = m.get("changes") or m.get("price_changes") or []
                 if not changes and m.get("price") is not None:
-                    changes = [{"price": m.get("price"), "size": m.get("size"),
-                                "side": m.get("side")}]
+                    changes = [{"price": m.get("price"), "size": m.get("size"), "side": m.get("side")}]
                 for c in changes:
                     try:
-                        b.apply_change(float(c["price"]), float(c.get("size", 0)),
-                                       str(c.get("side", "BUY")), ts)
+                        b.apply_change(float(c["price"]), float(c.get("size", 0)), str(c.get("side", "BUY")), ts)
                     except (KeyError, TypeError, ValueError):
                         continue
             elif et in ("best_bid_ask", "tick_size_change"):
@@ -437,28 +478,25 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
     """Direct synchronous REST refresh for a single token book."""
     if book.ready:
         return True
-    token_id = str(book.token_id).strip()
+    token_id = _valid_token_id(book.token_id)
     if not token_id:
         return False
+    print(f"[REST Fallback] Fetching book for token: {token_id}", flush=True)
     url = f"https://clob.polymarket.com/book?token_id={urllib.parse.quote(token_id)}"
-    print(f"[REST fallback] GET {url}", flush=True)
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "v7-sniper/1.0",
-            "Accept": "application/json",
-            "Referer": "https://polymarket.com/",
-        },
-    )
+    headers = {
+        "User-Agent": "v7-sniper/1.0",
+        "Accept": "application/json",
+        "Referer": "https://polymarket.com/",
+    }
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            payload = r.read().decode("utf-8", errors="replace")
-            print(f"[REST fallback] URL={url} response={payload[:2000]}", flush=True)
-            data = json.loads(payload)
+        resp = requests.get(url, timeout=timeout, headers=headers)
+        resp.raise_for_status()
+        payload = resp.json()
     except Exception as exc:  # noqa: BLE001
-        print(f"[REST fallback] FAIL URL={url} error={exc}", flush=True)
+        print(f"[REST Fallback] Failed for token={token_id} url={url} error={exc}", flush=True)
         return False
 
+    data = payload
     if isinstance(data, dict):
         if "book" in data and isinstance(data["book"], dict):
             data = data["book"]
@@ -466,18 +504,18 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
             data = data["data"]
 
     if not isinstance(data, dict):
-        print(f"[REST fallback] unexpected format for token_id={token_id}: {type(data).__name__}", flush=True)
+        print(f"[REST Fallback] Unexpected response shape for token={token_id}: {type(data).__name__}", flush=True)
         return False
 
     bids = data.get("bids") or data.get("buys") or data.get("bid")
     asks = data.get("asks") or data.get("sells") or data.get("ask")
     if bids is None or asks is None:
-        print(f"[REST fallback] no bids/asks in payload for token_id={token_id}: {data}", flush=True)
+        print(f"[REST Fallback] No bids/asks in payload for token={token_id}: {data}", flush=True)
         return False
 
     book.set_book(bids, asks, now_ms())
     print(
-        f"[REST fallback] refreshed token={token_id} bids={len(book.bids)} asks={len(book.asks)} "
+        f"[REST Fallback] Refreshed token={token_id} bids={len(book.bids)} asks={len(book.asks)} "
         f"best_bid={book.best_bid} best_ask={book.best_ask}",
         flush=True,
     )
