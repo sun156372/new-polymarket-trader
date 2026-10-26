@@ -18,11 +18,12 @@ force_trade_test=True:
 """
 from __future__ import annotations
 
+import json
 import logging
-import math
+import urllib.request
 from dataclasses import dataclass
 
-from core.feed import Book, Market
+from core.feed import Book, Market, try_refresh_book_snapshot
 
 LOG = logging.getLogger("v7.strategy")
 
@@ -196,14 +197,23 @@ class V6Strategy:
             return None
 
         if not up_book.ready and not p.force_trade_test:
-            self._debug(
-                market=market, secs=secs, up_book=up_book, down_book=down_book,
-                up_mid_open=up_mid_open, up_mid=None, spot_open=spot_open,
-                spot_now=spot_now, spot_move=None, imbalance=None, move=None,
-                side="", ask=None, reason="UP_BOOK_NOT_READY",
-            )
-            _gate("UP_BOOK_NOT_READY")
-            return None
+            print(f"[Strategy] trying REST fallback for up token={market.up_token} book_ready={up_book.ready}", flush=True)
+            refreshed = try_refresh_book_snapshot(up_book, market=market, timeout=10.0)
+            if refreshed:
+                print(
+                    f"[Strategy] REST fallback succeeded for {market.up_token}: "
+                    f"best_bid={up_book.best_bid} best_ask={up_book.best_ask}",
+                    flush=True,
+                )
+            else:
+                self._debug(
+                    market=market, secs=secs, up_book=up_book, down_book=down_book,
+                    up_mid_open=up_mid_open, up_mid=None, spot_open=spot_open,
+                    spot_now=spot_now, spot_move=None, imbalance=None, move=None,
+                    side="", ask=None, reason="UP_BOOK_NOT_READY",
+                )
+                _gate("UP_BOOK_NOT_READY")
+                return None
 
         up_mid = up_book.mid
         move = (up_mid - up_mid_open) if (up_mid is not None and up_mid_open is not None) else None
