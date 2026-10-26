@@ -29,6 +29,7 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+# --------------------------------------------------------------------------- book
 def _levels(raw: Any) -> list[tuple[float, float]]:
     """Normalize Polymarket bids/asks into [(price, size)]."""
     out: list[tuple[float, float]] = []
@@ -116,6 +117,7 @@ class Market:
     neg_risk: bool = False
 
 
+# ---------------------------------------------------------------------- discovery
 class MarketDiscovery:
     """Gamma market lookup for btc-updown-5m-<start_epoch>."""
 
@@ -204,6 +206,7 @@ class MarketDiscovery:
         return None
 
 
+# -------------------------------------------------------------------------- feeds
 class PolymarketFeed:
     def __init__(self, ws_url: str, max_backoff: float = 30.0):
         if websockets is None:
