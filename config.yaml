@@ -34,7 +34,7 @@ strategy:
   # DANGEROUS TEST SWITCH:
   # True = bypass ALL thresholds at T-240 and buy the best available side.
   # Use only to test open -> settle -> redeem -> balance, then set back to False.
-  force_trade_test: false
+  force_trade_test: true
 
 exit:
   enable_take_profit: false
