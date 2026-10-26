@@ -323,6 +323,7 @@ class PolymarketFeed:
 
         book = self.book(token)
         book.set_book(bids, asks, now_ms())
+        book.last_update_ms = now_ms()
         print(
             f"[REST Fallback] Refreshed token={token} bids={len(book.bids)} asks={len(book.asks)} "
             f"best_bid={book.best_bid} best_ask={book.best_ask}",
@@ -544,6 +545,7 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
         return False
 
     book.set_book(bids, asks, now_ms())
+    book.last_update_ms = now_ms()
     print(
         f"[REST Fallback] Refreshed token={token_id} bids={len(book.bids)} asks={len(book.asks)} "
         f"best_bid={book.best_bid} best_ask={book.best_ask}",
