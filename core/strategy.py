@@ -105,10 +105,14 @@ def _bps(spot_move: float) -> float:
     return spot_move * 1e4
 
 
+def _gate(reason: str) -> None:
+    """Terminal-visible gate result; independent of logging config."""
+    print(f"[Gate拦截] reason={reason}", flush=True)
+
+
 class V6Strategy:
     def __init__(self, params: V6Params):
         self.p = params
-        self._last_debug_market: str | None = None
 
     # ------------------------------------------------------------------ debug
     def _debug(self, *, market: Market, secs: float, up_book: Book, down_book: Book,
@@ -117,14 +121,8 @@ class V6Strategy:
                spot_move: float | None, imbalance: float | None,
                move: float | None, side: str, ask: float | None,
                reason: str) -> None:
-        if not self.p.debug:
-            return
-        # One block per market; do not spam every loop.
-        key = market.slug
-        if key == self._last_debug_market:
-            return
-        self._last_debug_market = key
-
+        # TEST MODE: force a terminal line for EVERY rejection, regardless of
+        # config.logging level or strategy.debug. This is intentionally loud.
         bid_vol5 = _volume(up_book, "bid", 5)
         ask_vol5 = _volume(up_book, "ask", 5)
         dbid_vol5 = _volume(down_book, "bid", 5)
@@ -133,6 +131,31 @@ class V6Strategy:
         an10 = _notional(up_book, "ask", self.p.imbalance_depth)
         sm_bps = _bps(spot_move) if spot_move is not None else float("nan")
         im = imbalance if imbalance is not None else float("nan")
+
+        print(
+            f"[Strategy][拦截] 原因={reason}"
+            f" market={market.slug}"
+            f" secs={secs:.2f}"
+            f" side={side}"
+            f" move={move if move is not None else 'None'}"
+            f" imbalance={im:.6f}"
+            f" spot_open={spot_open}"
+            f" spot_now={spot_now}"
+            f" spot_bps={sm_bps:.3f}"
+            f" bid_vol5={bid_vol5:.6f}"
+            f" ask_vol5={ask_vol5:.6f}"
+            f" bid_notional10={bn10:.6f}"
+            f" ask_notional10={an10:.6f}"
+            f" up_best_bid={up_book.best_bid}"
+            f" up_best_ask={up_book.best_ask}"
+            f" down_bid_vol5={dbid_vol5:.6f}"
+            f" down_ask_vol5={dask_vol5:.6f}"
+            f" ask={ask}",
+            flush=True,
+        )
+
+        if not self.p.debug:
+            return
 
         LOG.info(
             "[Debug] market=%s secs_to_close=%.2f reason=%s side=%s",
@@ -176,6 +199,7 @@ class V6Strategy:
 
         # Only the T-240 window is a decision point.
         if not (p.entry_t_minus_s - 2.5 <= secs <= p.entry_t_minus_s + 0.5):
+            _gate("NOT_T240")
             return None
 
         # Diagnostics run in the window even when data is missing.
@@ -186,6 +210,7 @@ class V6Strategy:
                 spot_now=spot_now, spot_move=None, imbalance=None, move=None,
                 side="", ask=None, reason="UP_BOOK_NOT_READY",
             )
+            _gate("UP_BOOK_NOT_READY")
             return None
 
         up_mid = up_book.mid
@@ -221,6 +246,7 @@ class V6Strategy:
                         spot_now=spot_now, spot_move=spot_move, imbalance=imb,
                         move=move, side=side, ask=None, reason="FORCE_NO_ASK",
                     )
+                    _gate("FORCE_NO_ASK")
                     return None
             ask = float(ask)
             bid = float(bid) if bid is not None else max(0.0, ask - 0.01)
@@ -248,6 +274,7 @@ class V6Strategy:
                 spot_now=spot_now, spot_move=spot_move, imbalance=imb,
                 move=move, side=side, ask=ask, reason="MISSING_UP_MID",
             )
+            _gate("MISSING_UP_MID")
             return None
         if spot_open is None or spot_open <= 0 or spot_now is None:
             self._debug(
@@ -256,6 +283,7 @@ class V6Strategy:
                 spot_now=spot_now, spot_move=spot_move, imbalance=imb,
                 move=move, side=side, ask=ask, reason="MISSING_SPOT",
             )
+            _gate("MISSING_SPOT")
             return None
         if move is None or abs(move) < p.move_threshold:
             self._debug(
@@ -264,6 +292,7 @@ class V6Strategy:
                 spot_now=spot_now, spot_move=spot_move, imbalance=imb,
                 move=move, side=side, ask=ask, reason="MOVE_TOO_SMALL",
             )
+            _gate("MOVE_TOO_SMALL")
             return None
         if imb is None or abs(imb) < p.min_book_imbalance:
             self._debug(
@@ -272,6 +301,7 @@ class V6Strategy:
                 spot_now=spot_now, spot_move=spot_move, imbalance=imb,
                 move=move, side=side, ask=ask, reason="IMBALANCE_TOO_SMALL",
             )
+            _gate("IMBALANCE_TOO_SMALL")
             return None
         if spot_move is None or abs(spot_move) < p.min_spot_move:
             self._debug(
@@ -280,6 +310,7 @@ class V6Strategy:
                 spot_now=spot_now, spot_move=spot_move, imbalance=imb,
                 move=move, side=side, ask=ask, reason="SPOT_TOO_SMALL",
             )
+            _gate("SPOT_TOO_SMALL")
             return None
 
         if not down_book.ready:
@@ -289,6 +320,7 @@ class V6Strategy:
                 spot_now=spot_now, spot_move=spot_move, imbalance=imb,
                 move=move, side=side, ask=ask, reason="DOWN_BOOK_NOT_READY",
             )
+            _gate("DOWN_BOOK_NOT_READY")
             return None
         if ask is None or bid is None or not (0 < ask < 1):
             self._debug(
@@ -297,6 +329,7 @@ class V6Strategy:
                 spot_now=spot_now, spot_move=spot_move, imbalance=imb,
                 move=move, side=side, ask=ask, reason="NO_QUOTE",
             )
+            _gate("NO_QUOTE")
             return None
         if now_ms - book.last_update_ms > p.max_quote_staleness_s * 1000:
             self._debug(
@@ -305,14 +338,16 @@ class V6Strategy:
                 spot_now=spot_now, spot_move=spot_move, imbalance=imb,
                 move=move, side=side, ask=ask, reason="STALE_QUOTE",
             )
+            _gate("STALE_QUOTE")
             return None
         if ask > p.max_entry_price:
             self._debug(
                 market=market, secs=secs, up_book=up_book, down_book=down_book,
                 up_mid_open=up_mid_open, up_mid=up_mid, spot_open=spot_open,
                 spot_now=spot_now, spot_move=spot_move, imbalance=imb,
-                move=move, side=side, ask=ask, reason="ENTRY_ABOVE_CAP",
+                move=move, side=side, ask=ask, reason="PRICE_TOO_HIGH",
             )
+            _gate("PRICE_TOO_HIGH")
             return None
 
         self._debug(
