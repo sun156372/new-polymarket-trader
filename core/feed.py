@@ -95,7 +95,10 @@ class Book:
     def set_book(self, bids: Any, asks: Any, ts_ms: int | None = None) -> None:
         self.bids = {p: s for p, s in _levels(bids)}
         self.asks = {p: s for p, s in _levels(asks)}
-        self.last_update_ms = ts_ms or now_ms()
+        # 强制使用本地接收时间，避免 WS/REST 返回老时间戳导致 quote stale
+        self.last_update_ms = int(time.time() * 1000)
+        if ts_ms is not None:
+            self.last_update_ms = max(self.last_update_ms, int(ts_ms))
 
     def apply_change(self, price: float, size: float, side: str, ts_ms: int | None = None) -> None:
         book = self.bids if side.upper() in ("BUY", "BID", "BIDS") else self.asks
@@ -103,14 +106,20 @@ class Book:
             book.pop(price, None)
         elif 0 < price < 1:
             book[price] = size
-        self.last_update_ms = ts_ms or now_ms()
+        # 强制刷新本地时间戳，确保新消息一定算最新
+        self.last_update_ms = int(time.time() * 1000)
+        if ts_ms is not None:
+            self.last_update_ms = max(self.last_update_ms, int(ts_ms))
 
     def set_top(self, bid: float | None, ask: float | None, ts_ms: int | None = None) -> None:
         if bid is not None and 0 < bid < 1:
             self.bids[bid] = self.bids.get(bid, 0.0) or 1e-9
         if ask is not None and 0 < ask < 1:
             self.asks[ask] = self.asks.get(ask, 0.0) or 1e-9
-        self.last_update_ms = ts_ms or now_ms()
+        # 强制刷新本地时间戳，确保新消息一定算最新
+        self.last_update_ms = int(time.time() * 1000)
+        if ts_ms is not None:
+            self.last_update_ms = max(self.last_update_ms, int(ts_ms))
 
     def imbalance(self, levels: int = 10) -> float | None:
         if not self.bids or not self.asks:
@@ -323,7 +332,8 @@ class PolymarketFeed:
 
         book = self.book(token)
         book.set_book(bids, asks, now_ms())
-        book.last_update_ms = now_ms()
+        # 强制刷新本地 book 时间戳，避免 REST 成功但仍被判为 stale
+        book.last_update_ms = int(time.time() * 1000)
         print(
             f"[REST Fallback] Refreshed token={token} bids={len(book.bids)} asks={len(book.asks)} "
             f"best_bid={book.best_bid} best_ask={book.best_ask}",
@@ -432,6 +442,8 @@ class PolymarketFeed:
 
                 if bids is not None or asks is not None:
                     b.set_book(bids or [], asks or [], ts)
+                    # 强制刷新本地时间戳，确保 WS 更新也算“刚收到”
+                    b.last_update_ms = int(time.time() * 1000)
 
             elif et == "price_change":
                 changes = m.get("changes") or m.get("price_changes") or []
@@ -445,11 +457,16 @@ class PolymarketFeed:
                             str(c.get("side", "BUY")),
                             ts,
                         )
+                        # 强制刷新本地时间戳，确保 price change 也算 fresh
+                        b.last_update_ms = int(time.time() * 1000)
                     except (KeyError, TypeError, ValueError):
                         continue
 
             elif et in ("best_bid_ask", "tick_size_change"):
-                b.last_update_ms = ts
+                b.last_update_ms = int(time.time() * 1000)
+
+    def _handle_price_change(self, raw: str | bytes) -> None:
+        pass
 
 
 class BinanceFeed:
@@ -545,7 +562,8 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
         return False
 
     book.set_book(bids, asks, now_ms())
-    book.last_update_ms = now_ms()
+    # 强制刷新本地时间戳，避免 REST 成功但仍被判为 stale
+    book.last_update_ms = int(time.time() * 1000)
     print(
         f"[REST Fallback] Refreshed token={token_id} bids={len(book.bids)} asks={len(book.asks)} "
         f"best_bid={book.best_bid} best_ask={book.best_ask}",
