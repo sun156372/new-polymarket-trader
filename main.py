@@ -336,56 +336,53 @@ class Runtime:
 
         self.analytics.maybe_print()
 
+    async def amain(config_path: str) -> int:
+        cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+        setup_logging(cfg)
+        LOG.info("V7 starting mode=%s config=%s", cfg.get("mode"), config_path)
 
-async def amain(config_path: str) -> int:
-    cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
-    setup_logging(cfg)
-    LOG.info("V7 starting mode=%s config=%s", cfg.get("mode"), config_path)
+        runtime = Runtime(cfg)
+        runtime.state.recover()
+        runtime.reconcile_recovered_paper()
 
-    runtime = Runtime(cfg)
-    runtime.state.recover()
-    runtime.reconcile_recovered_paper()
+        if runtime.mode == "live" and cfg.get("redeem", {}).get("enabled", True):
+            engine = RedeemEngine(
+                runtime.state,
+                interval_s=int(cfg.get("redeem", {}).get("interval_s", 60)),
+                finality_buffer_s=int(
+                    cfg.get("redeem", {}).get("finality_buffer_s", 30)
+                ),
+            )
+            asyncio.create_task(engine.run_forever(runtime.stop), name="redeem-engine")
 
-    if runtime.mode == "live" and cfg.get("redeem", {}).get("enabled", True):
-        engine = RedeemEngine(
-            runtime.state,
-            interval_s=int(cfg.get("redeem", {}).get("interval_s", 60)),
-            finality_buffer_s=int(
-                cfg.get("redeem", {}).get("finality_buffer_s", 30)
-            ),
-        )
-        asyncio.create_task(engine.run_forever(runtime.stop), name="redeem-engine")
+        await runtime.pm.start()
+        await runtime.binance.start()
 
-    await runtime.pm.start()
-    await runtime.binance.start()
+        def _stop(*_):
+            LOG.info("shutdown requested")
+            runtime.stop.set()
 
-    def _stop(*_):
-        LOG.info("shutdown requested")
-        runtime.stop.set()
+        signal.signal(signal.SIGINT, _stop)
+        signal.signal(signal.SIGTERM, _stop)
 
-    signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGTERM, _stop)
+        while not runtime.stop.is_set():
+            try:
+                await runtime.step()
+            except Exception:  # noqa: BLE001
+                LOG.exception("main loop step failed; continuing in 5s")
+                await asyncio.sleep(5)
+            await asyncio.sleep(0.25)
 
-    while not runtime.stop.is_set():
-        try:
-            await runtime.step()
-        except Exception:  # noqa: BLE001
-            LOG.exception("main loop step failed; continuing in 5s")
-            await asyncio.sleep(5)
-        await asyncio.sleep(0.25)
+        await runtime.pm.stop()
+        await runtime.binance.stop()
+        LOG.info("V7 stopped")
+        return 0
 
-    await runtime.pm.stop()
-    await runtime.binance.stop()
-    LOG.info("V7 stopped")
-    return 0
+    def main() -> int:
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--config", default="config.yaml")
+        args = ap.parse_args()
+        return asyncio.run(amain(args.config))
 
-
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="config.yaml")
-    args = ap.parse_args()
-    return asyncio.run(amain(args.config))
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    if __name__ == "__main__":
+        raise SystemExit(main())
