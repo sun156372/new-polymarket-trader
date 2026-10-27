@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import urllib.request
 from dataclasses import dataclass
 
@@ -28,6 +29,16 @@ from core.feed import Book, Market, try_refresh_book_snapshot
 LOG = logging.getLogger("v7.strategy")
 
 EPS = 1e-9
+
+
+def _valid_ask(ask: float | None) -> float | None:
+    try:
+        val = float(ask)
+    except Exception:
+        return None
+    if not math.isfinite(val) or val <= 0:
+        return None
+    return val
 
 
 @dataclass(frozen=True)
@@ -175,6 +186,7 @@ class V6Strategy:
             up_ask = up_book.best_ask
             down_ask = down_book.best_ask
             if up_ask is None and down_ask is None:
+                print(f"[Error] 价格无效 market={market.slug} ask=None both sides", flush=True)
                 return None
             if up_ask is not None and down_ask is not None:
                 side = "UP" if up_ask <= down_ask else "DOWN"
@@ -186,7 +198,9 @@ class V6Strategy:
                 side = "DOWN"
                 ask = down_ask
 
-            if ask is None or ask <= 0:
+            ask = _valid_ask(ask)
+            if ask is None:
+                print(f"[Error] 价格无效 market={market.slug} ask={ask}", flush=True)
                 return None
 
             bid = up_book.best_bid if side == "UP" else down_book.best_bid
@@ -228,6 +242,7 @@ class V6Strategy:
         ask_up = up_book.best_ask
         ask_down = down_book.best_ask
         if ask_up is None and ask_down is None:
+            print(f"[Error] 价格无效 market={market.slug} ask=None both sides", flush=True)
             return None
 
         if move >= self.p.move_threshold and imbalance >= self.p.min_book_imbalance:
@@ -246,9 +261,12 @@ class V6Strategy:
             _gate(reason)
             return None
 
-        if ask is None or ask <= 0:
+        ask = _valid_ask(ask)
+        if ask is None:
+            print(f"[Error] 价格无效 market={market.slug} ask={ask}", flush=True)
             _gate("no valid ask")
             return None
+
         if ask > self.p.max_entry_price:
             _gate(f"max entry ask {ask:.4f} > {self.p.max_entry_price:.4f}")
             return None
