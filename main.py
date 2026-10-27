@@ -85,13 +85,9 @@ class Runtime:
         )
 
         self.market: Market | None = None
-
-        # 关键修复：市场刚发现时就锁定开盘价；一旦锁定，整段 5 分钟窗口内不再覆盖
         self.up_mid_open: float | None = None
         self.spot_open: float | None = None
         self.market_open_locked = False
-        self.market_open_ts_ms: int | None = None
-
         self.entry_done = False
         self.paper_fill: Fill | None = None
         self.trade_id: str | None = None
@@ -107,16 +103,30 @@ class Runtime:
             return False
 
         self.market = m
+
+        # 修复：新市场刚被发现的瞬间立即锁定开盘价，不等 T-240
         self.up_mid_open = None
         self.spot_open = None
         self.market_open_locked = False
-        self.market_open_ts_ms = None
         self.entry_done = False
         self.paper_fill = None
         self.trade_id = None
 
-        # 修复核心：新市场一发现，立刻抓取并锁定开盘价，不等到 T-240
-        self._capture_open(now, force=True)
+        up = self.pm.get_tick(self.market.up_token, force_refresh=True, timeout=5.0)
+        if up is not None and up.mid is not None:
+            self.up_mid_open = float(up.mid)
+        spot = self.binance.spot()
+        if spot is not None:
+            self.spot_open = float(spot)
+
+        if self.up_mid_open is not None and self.spot_open is not None:
+            self.market_open_locked = True
+            LOG.info(
+                "[MarketOpen] immediate lock market=%s up_mid_open=%.6f spot_open=%.6f",
+                self.market.slug,
+                self.up_mid_open,
+                self.spot_open,
+            )
 
         await self.pm.subscribe([m.up_token, m.down_token])
         LOG.info(
@@ -145,24 +155,22 @@ class Runtime:
             )
 
     def _capture_open(self, now: int, force: bool = False) -> None:
-        """锁定一个新市场的开盘价，并在这一轮窗口里永远不再改写。"""
+        """只允许一次性锁定，不能在 T-240 时覆盖新市场开盘价。"""
         if not self.market or now < self.market.start_ms:
             return
 
-        # 一旦这轮市场开盘价已锁定，后续会一直保持不变，直到切换到下一个新市场
-        if self.market_open_locked and self.up_mid_open is not None and self.spot_open is not None:
+        if self.up_mid_open is not None and self.spot_open is not None:
+            self.market_open_locked = True
             return
 
-        # 允许强制立即锁定：在新市场被发现的那一瞬间
         if not force:
             secs = (self.market.end_ms - now) / 1000.0
-            # 仅在新市场发现/开始阶段尝试锁定，避免在已经运行中被覆盖
             if secs > 300.0:
                 return
 
         if self.up_mid_open is None:
             up = self.pm.get_tick(self.market.up_token, force_refresh=True)
-            if up is not None and up.ready and up.mid is not None:
+            if up is not None and up.mid is not None:
                 self.up_mid_open = float(up.mid)
 
         if self.spot_open is None:
@@ -172,12 +180,9 @@ class Runtime:
 
         if self.up_mid_open is not None and self.spot_open is not None:
             self.market_open_locked = True
-            self.market_open_ts_ms = now
-            secs = (self.market.end_ms - now) / 1000.0
             LOG.info(
-                "[MarketOpen] locked market=%s secs=%.2f up_mid_open=%.6f spot_open=%.6f",
+                "[MarketOpen] capture market=%s up_mid_open=%.6f spot_open=%.6f",
                 self.market.slug,
-                secs,
                 self.up_mid_open,
                 self.spot_open,
             )
@@ -317,32 +322,19 @@ class Runtime:
 
         assert self.market is not None
 
-        # 在每次循环中都尝试做“只锁一次”的捕获；一旦锁定就绝不覆盖
+        # 在新市场刚发现时已经锁定，不再在 T-240 才给 open 赋值
         self._capture_open(now)
 
         secs = (self.market.end_ms - now) / 1000.0
+
         in_window = (
             self.params.entry_t_minus_s - 2.5
             <= secs
             <= self.params.entry_t_minus_s + 0.5
         )
-
         if not self.entry_done and in_window:
             up = self.pm.get_tick(self.market.up_token, force_refresh=True)
             down = self.pm.get_tick(self.market.down_token, force_refresh=True)
-
-            if self.up_mid_open is not None and up is not None and up.mid is not None:
-                if abs(float(up.mid) - float(self.up_mid_open)) < 1e-12:
-                    LOG.warning(
-                        "[Main] WARNING: up_mid_open and up_mid nearly identical; "
-                        "this indicates open lock is too late or stale. "
-                        "market=%s secs=%.2f up_mid_open=%.6f up_mid=%.6f",
-                        self.market.slug,
-                        secs,
-                        self.up_mid_open,
-                        up.mid,
-                    )
-
             print(
                 "[Main] 正在执行策略判断..."
                 f" market={self.market.slug}"
