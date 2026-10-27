@@ -85,8 +85,13 @@ class Runtime:
         )
 
         self.market: Market | None = None
+
+        # 关键修复：市场刚发现时就锁定开盘价；一旦锁定，整段 5 分钟窗口内不再覆盖
         self.up_mid_open: float | None = None
         self.spot_open: float | None = None
+        self.market_open_locked = False
+        self.market_open_ts_ms: int | None = None
+
         self.entry_done = False
         self.paper_fill: Fill | None = None
         self.trade_id: str | None = None
@@ -104,9 +109,15 @@ class Runtime:
         self.market = m
         self.up_mid_open = None
         self.spot_open = None
+        self.market_open_locked = False
+        self.market_open_ts_ms = None
         self.entry_done = False
         self.paper_fill = None
         self.trade_id = None
+
+        # 修复核心：新市场一发现，立刻抓取并锁定开盘价，不等到 T-240
+        self._capture_open(now, force=True)
+
         await self.pm.subscribe([m.up_token, m.down_token])
         LOG.info(
             "[Market] %s start=%s end=%s condition=%s",
@@ -133,17 +144,43 @@ class Runtime:
                 p.market_slug,
             )
 
-    def _capture_open(self, now: int) -> None:
+    def _capture_open(self, now: int, force: bool = False) -> None:
+        """锁定一个新市场的开盘价，并在这一轮窗口里永远不再改写。"""
         if not self.market or now < self.market.start_ms:
             return
+
+        # 一旦这轮市场开盘价已锁定，后续会一直保持不变，直到切换到下一个新市场
+        if self.market_open_locked and self.up_mid_open is not None and self.spot_open is not None:
+            return
+
+        # 允许强制立即锁定：在新市场被发现的那一瞬间
+        if not force:
+            secs = (self.market.end_ms - now) / 1000.0
+            # 仅在新市场发现/开始阶段尝试锁定，避免在已经运行中被覆盖
+            if secs > 300.0:
+                return
+
         if self.up_mid_open is None:
             up = self.pm.get_tick(self.market.up_token, force_refresh=True)
             if up is not None and up.ready and up.mid is not None:
-                self.up_mid_open = up.mid
+                self.up_mid_open = float(up.mid)
+
         if self.spot_open is None:
             p = self.binance.spot()
-            if p:
-                self.spot_open = p
+            if p is not None:
+                self.spot_open = float(p)
+
+        if self.up_mid_open is not None and self.spot_open is not None:
+            self.market_open_locked = True
+            self.market_open_ts_ms = now
+            secs = (self.market.end_ms - now) / 1000.0
+            LOG.info(
+                "[MarketOpen] locked market=%s secs=%.2f up_mid_open=%.6f spot_open=%.6f",
+                self.market.slug,
+                secs,
+                self.up_mid_open,
+                self.spot_open,
+            )
 
     def _can_enter(self) -> tuple[bool, str]:
         active = len(self.state.active_positions())
@@ -279,23 +316,41 @@ class Runtime:
                 return
 
         assert self.market is not None
-        self._capture_open(now)
-        secs = (self.market.end_ms - now) / 1000.0
 
+        # 在每次循环中都尝试做“只锁一次”的捕获；一旦锁定就绝不覆盖
+        self._capture_open(now)
+
+        secs = (self.market.end_ms - now) / 1000.0
         in_window = (
             self.params.entry_t_minus_s - 2.5
             <= secs
             <= self.params.entry_t_minus_s + 0.5
         )
+
         if not self.entry_done and in_window:
             up = self.pm.get_tick(self.market.up_token, force_refresh=True)
             down = self.pm.get_tick(self.market.down_token, force_refresh=True)
+
+            if self.up_mid_open is not None and up is not None and up.mid is not None:
+                if abs(float(up.mid) - float(self.up_mid_open)) < 1e-12:
+                    LOG.warning(
+                        "[Main] WARNING: up_mid_open and up_mid nearly identical; "
+                        "this indicates open lock is too late or stale. "
+                        "market=%s secs=%.2f up_mid_open=%.6f up_mid=%.6f",
+                        self.market.slug,
+                        secs,
+                        self.up_mid_open,
+                        up.mid,
+                    )
+
             print(
                 "[Main] 正在执行策略判断..."
                 f" market={self.market.slug}"
                 f" secs={secs:.2f}"
                 f" up_mid_open={self.up_mid_open}"
                 f" spot_open={self.spot_open}"
+                f" up_mid={up.mid if up else None}"
+                f" spot_now={self.binance.spot()}"
                 f" up_ready={up.ready if up else False}"
                 f" down_ready={down.ready if down else False}"
                 f" up_best_bid={up.best_bid if up else None}"
@@ -303,6 +358,7 @@ class Runtime:
                 f" force={self.params.force_trade_test}",
                 flush=True,
             )
+
             sig = self.strategy.evaluate(
                 market=self.market,
                 up_book=up,
@@ -326,7 +382,6 @@ class Runtime:
         self.analytics.maybe_print()
 
 
-# 🚀 修复：把 amain 移出 Runtime 类，作为全局异步函数
 async def amain(config_path: str) -> int:
     cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
     setup_logging(cfg)
