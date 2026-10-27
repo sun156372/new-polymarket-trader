@@ -95,7 +95,6 @@ class Book:
     def set_book(self, bids: Any, asks: Any, ts_ms: int | None = None) -> None:
         self.bids = {p: s for p, s in _levels(bids)}
         self.asks = {p: s for p, s in _levels(asks)}
-        # Always stamp with local receive time so stale guards use fresh clock.
         self.last_update_ms = int(time.time() * 1000)
         if ts_ms is not None:
             self.last_update_ms = max(self.last_update_ms, int(ts_ms))
@@ -227,13 +226,27 @@ class MarketDiscovery:
             if not data:
                 return None
             m = data[0]
-            if not (m.get("closed") or m.get("resolved")):
+
+            closed = m.get("closed")
+            if closed is None:
+                closed = m.get("resolved")
+            if closed is None:
+                closed = False
+            if not bool(closed):
                 return None
-            w = str(m.get("winningOutcome") or m.get("winner") or "").lower()
+
+            w = m.get("winningOutcome")
+            if w is None:
+                w = m.get("winner")
+            if w is None:
+                w = ""
+            w = str(w).lower()
+
             if w in ("up", "yes"):
                 return "UP"
             if w in ("down", "no"):
                 return "DOWN"
+
             outcomes = [str(x) for x in self._json_list(m.get("outcomes"))]
             prices = self._json_list(m.get("outcomePrices"))
             if outcomes and prices:
@@ -278,10 +291,29 @@ class PolymarketFeed:
         token = _valid_token_id(token_id)
         if token is None:
             return None
+
         book = self.book(token)
-        if force_refresh and not book.ready:
-            print(f"[REST Fallback] Fetching book for token: {token}", flush=True)
-            return self.refresh_book_snapshot(token, timeout=timeout)
+
+        if force_refresh:
+            now = now_ms()
+            stale = False
+            if not book.ready:
+                stale = True
+            else:
+                if book.last_update_ms <= 0:
+                    stale = True
+                elif now - book.last_update_ms > 1000:
+                    stale = True
+
+            if stale:
+                print(
+                    f"[REST Fallback] stale/empty book for token={token} age_ms={now - book.last_update_ms if book.last_update_ms else 'n/a'}",
+                    flush=True,
+                )
+                refreshed = self.refresh_book_snapshot(token, timeout=timeout)
+                if refreshed is not None:
+                    return refreshed
+
         return book
 
     def refresh_book_snapshot(self, token_id: str, timeout: float = 10.0) -> Book | None:
@@ -316,12 +348,13 @@ class PolymarketFeed:
             print(f"[REST Fallback] Unexpected response shape for token={token}: {type(data).__name__}", flush=True)
             return None
 
-        # Explicit None checks only: never use `or` here.
+        # 显式 None 判断，绝不使用 `or` 串联 dict.get()
         bids = data.get("bids")
         if bids is None:
             bids = data.get("buys")
         if bids is None:
             bids = data.get("bid")
+
         if bids is None and "book" in data and isinstance(data["book"], dict):
             book_obj = data["book"]
             bids = book_obj.get("bids")
@@ -329,6 +362,7 @@ class PolymarketFeed:
                 bids = book_obj.get("buys")
             if bids is None:
                 bids = book_obj.get("bid")
+
         if bids is None:
             bids = []
 
@@ -337,6 +371,7 @@ class PolymarketFeed:
             asks = data.get("sells")
         if asks is None:
             asks = data.get("ask")
+
         if asks is None and "book" in data and isinstance(data["book"], dict):
             book_obj = data["book"]
             asks = book_obj.get("asks")
@@ -344,6 +379,7 @@ class PolymarketFeed:
                 asks = book_obj.get("sells")
             if asks is None:
                 asks = book_obj.get("ask")
+
         if asks is None:
             asks = []
 
@@ -392,8 +428,13 @@ class PolymarketFeed:
         backoff = 1.0
         while not self._stop.is_set():
             try:
-                async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20,
-                                              close_timeout=5, max_size=16 * 1024 * 1024) as ws:
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                    max_size=16 * 1024 * 1024,
+                ) as ws:
                     self._ws = ws
                     backoff = 1.0
                     if self.tokens:
@@ -421,25 +462,35 @@ class PolymarketFeed:
             if not isinstance(m, dict):
                 continue
 
-            et = str(m.get("event_type") or m.get("type") or m.get("eventType") or "").lower()
-            token = str(
-                m.get("asset_id")
-                or m.get("token_id")
-                or m.get("tokenId")
-                or m.get("assetId")
-                or ""
-            )
+            event_type = m.get("event_type")
+            if event_type is None:
+                event_type = m.get("type")
+            if event_type is None:
+                event_type = m.get("eventType")
+            if event_type is None:
+                event_type = ""
+            et = str(event_type).lower()
+
+            token = m.get("asset_id")
+            if token is None:
+                token = m.get("token_id")
+            if token is None:
+                token = m.get("tokenId")
+            if token is None:
+                token = m.get("assetId")
+            if token is None:
+                token = ""
 
             if not token:
                 payload = m.get("payload")
                 if isinstance(payload, dict):
-                    token = str(
-                        payload.get("asset_id")
-                        or payload.get("token_id")
-                        or payload.get("tokenId")
-                        or ""
-                    )
-
+                    token = payload.get("asset_id")
+                    if token is None:
+                        token = payload.get("token_id")
+                    if token is None:
+                        token = payload.get("tokenId")
+                    if token is None:
+                        token = ""
             token = _valid_token_id(token)
             if not token:
                 continue
@@ -453,6 +504,7 @@ class PolymarketFeed:
                     bids = m.get("buys")
                 if bids is None:
                     bids = m.get("bid")
+
                 asks = m.get("asks")
                 if asks is None:
                     asks = m.get("sells")
@@ -464,9 +516,21 @@ class PolymarketFeed:
                     b.last_update_ms = int(time.time() * 1000)
 
             elif et == "price_change":
-                changes = m.get("changes") or m.get("price_changes") or []
+                changes = m.get("changes")
+                if changes is None:
+                    changes = m.get("price_changes")
+                if changes is None:
+                    changes = []
+
                 if not changes and m.get("price") is not None:
-                    changes = [{"price": m.get("price"), "size": m.get("size"), "side": m.get("side")}]
+                    changes = [
+                        {
+                            "price": m.get("price"),
+                            "size": m.get("size"),
+                            "side": m.get("side"),
+                        }
+                    ]
+
                 for c in changes:
                     try:
                         b.apply_change(
@@ -571,12 +635,13 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
         print(f"[REST Fallback] Unexpected response shape for token={token_id}: {type(data).__name__}", flush=True)
         return False
 
-    # Explicit None checks only: never use `or` here.
+    # 显式 None 判断，绝不使用 `or` 串联 dict.get()
     bids = data.get("bids")
     if bids is None:
         bids = data.get("buys")
     if bids is None:
         bids = data.get("bid")
+
     if bids is None and "book" in data and isinstance(data["book"], dict):
         book_obj = data["book"]
         bids = book_obj.get("bids")
@@ -584,6 +649,7 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
             bids = book_obj.get("buys")
         if bids is None:
             bids = book_obj.get("bid")
+
     if bids is None:
         bids = []
 
@@ -592,6 +658,7 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
         asks = data.get("sells")
     if asks is None:
         asks = data.get("ask")
+
     if asks is None and "book" in data and isinstance(data["book"], dict):
         book_obj = data["book"]
         asks = book_obj.get("asks")
@@ -599,6 +666,7 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
             asks = book_obj.get("sells")
         if asks is None:
             asks = book_obj.get("ask")
+
     if asks is None:
         asks = []
 
