@@ -19,6 +19,22 @@ from core.strategy import Signal, V6Params
 LOG = logging.getLogger("v7.executor")
 
 
+def _coerce_valid_ask(signal: Signal | None) -> float:
+    if signal is None:
+        print("[Error] 价格无效 signal=None", flush=True)
+        raise ValueError("invalid signal")
+    ask = signal.ask
+    try:
+        ask_f = float(ask)
+    except Exception:
+        print(f"[Error] 价格无效 ask={ask!r}", flush=True)
+        raise ValueError("invalid ask") from None
+    if not math.isfinite(ask_f) or ask_f <= 0:
+        print(f"[Error] 价格无效 ask={ask!r}", flush=True)
+        raise ValueError("invalid ask")
+    return ask_f
+
+
 @dataclass
 class Fill:
     market_slug: str
@@ -52,11 +68,13 @@ class PaperExecutor(BaseExecutor):
         self.fee_coefficient = fee_coefficient
 
     def buy(self, signal: Signal, stake_usdc: float) -> Fill:
+        ask = _coerce_valid_ask(signal)
+
         stake = min(float(stake_usdc), self.balance)
         if stake <= 0:
             raise RuntimeError("paper balance exhausted")
 
-        fill_price = min(0.999, signal.ask + self.slippage)
+        fill_price = min(0.999, ask + self.slippage)
         shares = stake / fill_price
 
         if not math.isfinite(shares) or shares <= 0:
@@ -91,21 +109,25 @@ class PaperExecutor(BaseExecutor):
             token_id=signal.market.up_token if signal.side == "UP" else signal.market.down_token,
             entry_price=fill_price, shares=shares, stake_usdc=stake, fee_usdc=fee,
             order_id=f"paper-{int(__import__('time').time() * 1000)}",
-            raw={"paper": True, "ask": signal.ask, "slippage": self.slippage},
+            raw={"paper": True, "ask": ask, "slippage": self.slippage},
         )
         LOG.info("[Paper] BUY %s %s shares=%.4f entry=%.4f fee=%.4f cost=%.4f",
                  fill.market_slug, fill.side, shares, fill_price, fee, cost)
         return fill
 
     def settle_paper(self, fill: Fill, winner: str) -> float:
-        won = fill.side == winner
-        payout = fill.shares if won else 0.0
-        cost = fill.shares * fill.entry_price + fill.fee_usdc
-        pnl = payout - cost
-        self.balance += payout
-        LOG.info("[Paper] SETTLE %s %s winner=%s won=%s payout=%.4f pnl=%+.4f",
-                 fill.market_slug, fill.side, winner, won, payout, pnl)
-        return pnl
+        try:
+            won = fill.side == winner
+            payout = fill.shares if won else 0.0
+            cost = fill.shares * fill.entry_price + fill.fee_usdc
+            pnl = payout - cost
+            self.balance += payout
+            LOG.info("[Paper] SETTLE %s %s winner=%s won=%s payout=%.4f pnl=%+.4f",
+                     fill.market_slug, fill.side, winner, won, payout, pnl)
+            return pnl
+        except Exception as exc:  # 防弹衣
+            print(f"[Settle Error] market={getattr(fill, 'market_slug', 'unknown')} side={getattr(fill, 'side', 'unknown')} error={exc}", flush=True)
+            return 0.0
 
 
 class LiveExecutor(BaseExecutor):
@@ -153,6 +175,7 @@ class LiveExecutor(BaseExecutor):
         LOG.info("LIVE CLOB client initialized (chain_id=%s signature_type=%s)", chain_id, sig_type)
 
     def buy(self, signal: Signal, stake_usdc: float) -> Fill:
+        ask = _coerce_valid_ask(signal)
         if self._client is None:
             raise RuntimeError("LIVE client not initialized")
         token_id = signal.market.up_token if signal.side == "UP" else signal.market.down_token
@@ -171,8 +194,8 @@ class LiveExecutor(BaseExecutor):
             raise RuntimeError(f"order not filled: {resp}")
         taking = float(resp.get("takingAmount") or 0.0)
         making = float(resp.get("makingAmount") or 0.0)
-        shares = taking if taking > 0 else float(stake_usdc) / max(signal.ask, 1e-9)
-        entry = (making / shares) if shares > 0 and making > 0 else signal.ask
+        shares = taking if taking > 0 else float(stake_usdc) / max(ask, 1e-9)
+        entry = (making / shares) if shares > 0 and making > 0 else ask
         fee = shares * 0.07 * entry * (1 - entry)
         fill = Fill(
             market_slug=signal.market.slug, side=signal.side, token_id=token_id,
