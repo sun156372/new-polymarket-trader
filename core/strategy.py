@@ -33,12 +33,12 @@ EPS = 1e-9
 
 def _valid_ask(ask: float | None) -> float | None:
     try:
-        val = float(ask)
+        value = float(ask)
     except Exception:
         return None
-    if not math.isfinite(val) or val <= 0:
+    if not math.isfinite(value) or value <= 0:
         return None
-    return val
+    return value
 
 
 @dataclass(frozen=True)
@@ -50,14 +50,16 @@ class V6Params:
     min_book_imbalance: float = 0.30
     min_spot_move: float = 0.00020
     max_entry_price: float = 0.95
-    max_quote_staleness_s: float = 2.0
+    max_quote_staleness_s: float = 5.0
     max_slippage_cents: float = 2.0
     debug: bool = True
     force_trade_test: bool = False
 
     @classmethod
     def from_config(cls, cfg: dict) -> "V6Params":
-        strategy_cfg = cfg.get("strategy", {}) if isinstance(cfg.get("strategy", {}), dict) else {}
+        strategy_cfg = (
+            cfg.get("strategy", {}) if isinstance(cfg.get("strategy", {}), dict) else {}
+        )
         value = strategy_cfg.get("force_trade_test", cfg.get("force_trade_test", False))
         return cls(
             entry_t_minus_s=float(strategy_cfg.get("entry_t_minus_s", 240.0)),
@@ -67,7 +69,9 @@ class V6Params:
             min_book_imbalance=float(strategy_cfg.get("min_book_imbalance", 0.30)),
             min_spot_move=float(strategy_cfg.get("min_spot_move", 0.00020)),
             max_entry_price=float(strategy_cfg.get("max_entry_price", 0.95)),
-            max_quote_staleness_s=float(strategy_cfg.get("max_quote_staleness_s", 2.0)),
+            max_quote_staleness_s=float(
+                strategy_cfg.get("max_quote_staleness_s", 5.0)
+            ),
             max_slippage_cents=float(strategy_cfg.get("max_slippage_cents", 2.0)),
             debug=bool(strategy_cfg.get("debug", True)),
             force_trade_test=bool(value),
@@ -181,7 +185,7 @@ class V6Strategy:
         if secs <= 0:
             return None
 
-        # 强制测试模式：最优先，忽略 stale 检查
+        # 强制测试模式：优先，且直接绕过 quote stale
         if self.p.force_trade_test:
             up_ask = up_book.best_ask
             down_ask = down_book.best_ask
@@ -231,8 +235,14 @@ class V6Strategy:
             return None
 
         move = up_mid - up_mid_open
-        spot_move = None if spot_open is None or spot_now is None else float(spot_now - spot_open)
-        imbalance = _imbalance(up_book, self.p.imbalance_depth) - _imbalance(down_book, self.p.imbalance_depth)
+        spot_move = (
+            None
+            if spot_open is None or spot_now is None
+            else float(spot_now - spot_open)
+        )
+        imbalance = _imbalance(up_book, self.p.imbalance_depth) - _imbalance(
+            down_book, self.p.imbalance_depth
+        )
 
         stale_ms = max(up_book.last_update_ms, down_book.last_update_ms)
         if stale_ms and now_ms - stale_ms > self.p.max_quote_staleness_s * 1000:
