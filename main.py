@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import signal
 import sys
 import time
@@ -92,6 +93,30 @@ class Runtime:
         self.paper_fill: Fill | None = None
         self.trade_id: str | None = None
         self.stop = asyncio.Event()
+
+    def _sanitize_state_on_startup(self) -> None:
+        """Startup self-check: remove invalid positions with entry_price=None/<=0."""
+        cleaned = 0
+        for p in self.state.positions():
+            entry = p.entry_price
+            valid = False
+            try:
+                val = float(entry)
+                valid = math.isfinite(val) and val > 0
+            except Exception:
+                valid = False
+
+            if not valid:
+                print(
+                    f"[State] 警告: 清理坏单 trade_id={p.trade_id} market={p.market_slug} "
+                    f"entry_price={entry!r} status={p.status}",
+                    flush=True,
+                )
+                self.state.remove_position(p.trade_id)
+                cleaned += 1
+
+        if cleaned:
+            LOG.warning("[State] removed %d invalid position(s) at startup", cleaned)
 
     async def _roll_market(self, now: int) -> bool:
         slug, _ = MarketDiscovery.slug_for(now)
@@ -203,6 +228,19 @@ class Runtime:
         )
 
     async def _enter(self, sig) -> None:
+        # 严格拦截坏单：ask为None/<=0不能出现在 state.json
+        try:
+            ask_value = float(sig.ask)
+        except Exception:
+            ask_value = None
+        if sig is None or sig.ask is None or ask_value is None or not math.isfinite(ask_value) or ask_value <= 0:
+            print(
+                f"[Error] 拦截坏单: market={getattr(sig.market, 'slug', 'unknown')} "
+                f"ask={getattr(sig, 'ask', None)!r} reason=invalid signal.ask",
+                flush=True,
+            )
+            return
+
         if self.state.has_open_market(sig.market.slug):
             LOG.info("[Skip] already have position for %s", sig.market.slug)
             return
@@ -214,7 +252,7 @@ class Runtime:
 
         stake = float(self.cfg.get("risk", {}).get("stake_usdc", 10.0))
         trade_id = new_trade_id(sig.market.slug, sig.side)
-        est_shares = stake / max(sig.ask, 1e-9)
+        est_shares = stake / max(float(sig.ask), 1e-9)
         pos = Position(
             trade_id=trade_id,
             market_slug=sig.market.slug,
@@ -223,7 +261,7 @@ class Runtime:
                 sig.market.up_token if sig.side == "UP" else sig.market.down_token
             ),
             side=sig.side,
-            entry_price=sig.ask,
+            entry_price=float(sig.ask),
             shares=est_shares,
             opened_at_ms=now_ms(),
             end_time_ms=sig.market.end_ms,
@@ -235,11 +273,14 @@ class Runtime:
 
         try:
             fill = await asyncio.to_thread(self.executor.buy, sig, stake)
+            if fill.entry_price is None or not math.isfinite(float(fill.entry_price)) or float(fill.entry_price) <= 0:
+                raise ValueError(f"invalid fill entry price: {fill.entry_price!r}")
+
             self.state.update_position(
                 trade_id,
                 status="open",
-                entry_price=fill.entry_price,
-                shares=fill.shares,
+                entry_price=float(fill.entry_price),
+                shares=float(fill.shares),
                 order_id=fill.order_id,
             )
             if self.mode == "paper":
@@ -250,20 +291,21 @@ class Runtime:
                 f"[{'Paper' if self.mode == 'paper' else 'Live'}] 买入"
                 f" market={sig.market.slug}"
                 f" side={sig.side}"
-                f" ask={sig.ask:.4f}"
-                f" fill={fill.entry_price:.4f}"
-                f" shares={fill.shares:.4f}",
+                f" ask={float(sig.ask):.4f}"
+                f" fill={float(fill.entry_price):.4f}"
+                f" shares={float(fill.shares):.4f}",
                 flush=True,
             )
             LOG.info(
                 "[Entry] %s %s ask=%.4f fill=%.4f shares=%.4f",
                 sig.market.slug,
                 sig.side,
-                sig.ask,
-                fill.entry_price,
-                fill.shares,
+                float(sig.ask),
+                float(fill.entry_price),
+                float(fill.shares),
             )
-        except Exception:
+        except Exception as exc:
+            print(f"[Error] 下单失败，清理坏单 trade_id={trade_id} error={exc}", flush=True)
             self.state.remove_position(trade_id)
             raise
 
@@ -278,35 +320,48 @@ class Runtime:
             return
 
         if self.paper_fill is not None and self.trade_id:
-            pnl = self.executor.settle_paper(self.paper_fill, winner)
-            self.analytics.record(
-                pnl=pnl,
-                stake=self.paper_fill.stake_usdc,
-                won=self.paper_fill.side == winner,
-                market=self.paper_fill.market_slug,
-                side=self.paper_fill.side,
-            )
-            self.state.remove_position(self.trade_id)
-            self.paper_fill = None
-            self.trade_id = None
+            try:
+                pnl = self.executor.settle_paper(self.paper_fill, winner)
+                self.analytics.record(
+                    pnl=pnl,
+                    stake=self.paper_fill.stake_usdc,
+                    won=self.paper_fill.side == winner,
+                    market=self.paper_fill.market_slug,
+                    side=self.paper_fill.side,
+                )
+                self.state.remove_position(self.trade_id)
+                self.paper_fill = None
+                self.trade_id = None
+            except Exception as e:
+                print(f"[Settle Error] 清理坏账: {e}", flush=True)
+                if self.trade_id:
+                    self.state.remove_position(self.trade_id)
+                self.paper_fill = None
+                self.trade_id = None
 
         for p in self.state.active_positions():
             if p.market_slug == self.market.slug and p.status == "open":
-                won = p.side.upper() == winner
-                payout = p.shares if won else 0.0
-                cost = (
-                    p.shares * p.entry_price
-                    + p.shares * 0.07 * p.entry_price * (1 - p.entry_price)
-                )
-                pnl = payout - cost
-                self.analytics.record(
-                    pnl=pnl,
-                    stake=cost,
-                    won=won,
-                    market=p.market_slug,
-                    side=p.side,
-                )
-                self.state.remove_position(p.trade_id)
+                try:
+                    won = p.side.upper() == winner
+                    payout = p.shares if won else 0.0
+                    cost = (
+                        p.shares * p.entry_price
+                        + p.shares * 0.07 * p.entry_price * (1 - p.entry_price)
+                    )
+                    pnl = payout - cost
+                    if not math.isfinite(pnl):
+                        raise ValueError(f"invalid pnl: {pnl!r}")
+                    self.analytics.record(
+                        pnl=pnl,
+                        stake=cost,
+                        won=won,
+                        market=p.market_slug,
+                        side=p.side,
+                    )
+                    self.state.remove_position(p.trade_id)
+                except Exception as e:
+                    print(f"[Settle Error] 清理坏账: {e}", flush=True)
+                    self.state.remove_position(p.trade_id)
 
     async def step(self) -> None:
         now = now_ms()
@@ -373,52 +428,52 @@ class Runtime:
 
         self.analytics.maybe_print()
 
+    async def amain(config_path: str) -> int:
+        cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+        setup_logging(cfg)
+        LOG.info("V7 starting mode=%s config=%s", cfg.get("mode"), config_path)
 
-async def amain(config_path: str) -> int:
-    cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
-    setup_logging(cfg)
-    LOG.info("V7 starting mode=%s config=%s", cfg.get("mode"), config_path)
+        runtime = Runtime(cfg)
+        params = runtime.params
+        print(f"Loaded force_trade_test={params.force_trade_test}", flush=True)
+        print(f"Loaded full config strategy={cfg.get('strategy', {})}", flush=True)
 
-    runtime = Runtime(cfg)
-    params = runtime.params
-    print(f"Loaded force_trade_test={params.force_trade_test}", flush=True)
-    print(f"Loaded full config strategy={cfg.get('strategy', {})}", flush=True)
+        runtime.state.recover()
+        runtime._sanitize_state_on_startup()
+        runtime.reconcile_recovered_paper()
 
-    runtime.state.recover()
-    runtime.reconcile_recovered_paper()
+        if runtime.mode == "live" and cfg.get("redeem", {}).get("enabled", True):
+            engine = RedeemEngine(
+                runtime.state,
+                interval_s=int(cfg.get("redeem", {}).get("interval_s", 60)),
+                finality_buffer_s=int(
+                    cfg.get("redeem", {}).get("finality_buffer_s", 30)
+                ),
+            )
+            asyncio.create_task(engine.run_forever(runtime.stop), name="redeem-engine")
 
-    if runtime.mode == "live" and cfg.get("redeem", {}).get("enabled", True):
-        engine = RedeemEngine(
-            runtime.state,
-            interval_s=int(cfg.get("redeem", {}).get("interval_s", 60)),
-            finality_buffer_s=int(
-                cfg.get("redeem", {}).get("finality_buffer_s", 30)
-            ),
-        )
-        asyncio.create_task(engine.run_forever(runtime.stop), name="redeem-engine")
+        await runtime.pm.start()
+        await runtime.binance.start()
 
-    await runtime.pm.start()
-    await runtime.binance.start()
+        def _stop(*_):
+            LOG.info("shutdown requested")
+            runtime.stop.set()
 
-    def _stop(*_):
-        LOG.info("shutdown requested")
-        runtime.stop.set()
+        signal.signal(signal.SIGINT, _stop)
+        signal.signal(signal.SIGTERM, _stop)
 
-    signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGTERM, _stop)
+        while not runtime.stop.is_set():
+            try:
+                await runtime.step()
+            except Exception:
+                LOG.exception("main loop step failed; continuing in 5s")
+                await asyncio.sleep(5)
+            await asyncio.sleep(0.25)
 
-    while not runtime.stop.is_set():
-        try:
-            await runtime.step()
-        except Exception:
-            LOG.exception("main loop step failed; continuing in 5s")
-            await asyncio.sleep(5)
-        await asyncio.sleep(0.25)
-
-    await runtime.pm.stop()
-    await runtime.binance.stop()
-    LOG.info("V7 stopped")
-    return 0
+        await runtime.pm.stop()
+        await runtime.binance.stop()
+        LOG.info("V7 stopped")
+        return 0
 
 
 def main() -> int:
