@@ -128,8 +128,6 @@ class Runtime:
             return False
 
         self.market = m
-
-        # 修复：新市场刚被发现的瞬间立即锁定开盘价，不等 T-240
         self.up_mid_open = None
         self.spot_open = None
         self.market_open_locked = False
@@ -169,18 +167,21 @@ class Runtime:
         for p in self.state.active_positions():
             if p.status != "open":
                 continue
-            fee = p.shares * 0.07 * p.entry_price * (1 - p.entry_price)
-            cost = p.shares * p.entry_price + fee
-            self.executor.balance -= cost
-            self.analytics.balance -= cost
-            LOG.info(
-                "[Paper] recovered open position cost=%.4f market=%s",
-                cost,
-                p.market_slug,
-            )
+            try:
+                fee = p.shares * 0.07 * p.entry_price * (1 - p.entry_price)
+                cost = p.shares * p.entry_price + fee
+                self.executor.balance -= cost
+                self.analytics.balance -= cost
+                LOG.info(
+                    "[Paper] recovered open position cost=%.4f market=%s",
+                    cost,
+                    p.market_slug,
+                )
+            except Exception as e:
+                print(f"[Settle Error] 清理坏账: {e}", flush=True)
+                self.state.remove_position(p.trade_id)
 
     def _capture_open(self, now: int, force: bool = False) -> None:
-        """只允许一次性锁定，不能在 T-240 时覆盖新市场开盘价。"""
         if not self.market or now < self.market.start_ms:
             return
 
@@ -228,7 +229,6 @@ class Runtime:
         )
 
     async def _enter(self, sig) -> None:
-        # 严格拦截坏单：ask为None/<=0不能出现在 state.json
         try:
             ask_value = float(sig.ask)
         except Exception:
@@ -377,11 +377,9 @@ class Runtime:
 
         assert self.market is not None
 
-        # 在新市场刚发现时已经锁定，不再在 T-240 才给 open 赋值
         self._capture_open(now)
 
         secs = (self.market.end_ms - now) / 1000.0
-
         in_window = (
             self.params.entry_t_minus_s - 2.5
             <= secs
@@ -428,59 +426,91 @@ class Runtime:
 
         self.analytics.maybe_print()
 
-    async def amain(config_path: str) -> int:
-        cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
-        setup_logging(cfg)
-        LOG.info("V7 starting mode=%s config=%s", cfg.get("mode"), config_path)
 
-        runtime = Runtime(cfg)
-        params = runtime.params
-        print(f"Loaded force_trade_test={params.force_trade_test}", flush=True)
-        print(f"Loaded full config strategy={cfg.get('strategy', {})}", flush=True)
+def _build_runtime(config_path: str) -> Runtime:
+    cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+    if not isinstance(cfg, dict):
+        raise ValueError(f"invalid config file: {config_path}")
+    setup_logging(cfg)
+    runtime = Runtime(cfg)
+    return runtime
 
-        runtime.state.recover()
-        runtime._sanitize_state_on_startup()
-        runtime.reconcile_recovered_paper()
 
-        if runtime.mode == "live" and cfg.get("redeem", {}).get("enabled", True):
-            engine = RedeemEngine(
-                runtime.state,
-                interval_s=int(cfg.get("redeem", {}).get("interval_s", 60)),
-                finality_buffer_s=int(
-                    cfg.get("redeem", {}).get("finality_buffer_s", 30)
-                ),
-            )
-            asyncio.create_task(engine.run_forever(runtime.stop), name="redeem-engine")
+async def amain(config_path: str) -> int:
+    cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+    if not isinstance(cfg, dict):
+        raise ValueError(f"invalid config file: {config_path}")
 
-        await runtime.pm.start()
-        await runtime.binance.start()
+    setup_logging(cfg)
+    LOG.info("V7 starting mode=%s config=%s", cfg.get("mode"), config_path)
 
-        def _stop(*_):
-            LOG.info("shutdown requested")
-            runtime.stop.set()
+    runtime = Runtime(cfg)
+    params = runtime.params
+    print(f"Loaded force_trade_test={params.force_trade_test}", flush=True)
+    print(f"Loaded full config strategy={cfg.get('strategy', {})}", flush=True)
 
-        signal.signal(signal.SIGINT, _stop)
-        signal.signal(signal.SIGTERM, _stop)
+    runtime.state.recover()
+    runtime._sanitize_state_on_startup()
+    runtime.reconcile_recovered_paper()
 
+    if runtime.mode == "live" and cfg.get("redeem", {}).get("enabled", True):
+        engine = RedeemEngine(
+            runtime.state,
+            interval_s=int(cfg.get("redeem", {}).get("interval_s", 60)),
+            finality_buffer_s=int(
+                cfg.get("redeem", {}).get("finality_buffer_s", 30)
+            ),
+        )
+        asyncio.create_task(engine.run_forever(runtime.stop), name="redeem-engine")
+
+    await runtime.pm.start()
+    await runtime.binance.start()
+
+    def _stop(*_):
+        LOG.info("shutdown requested")
+        runtime.stop.set()
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    try:
         while not runtime.stop.is_set():
             try:
                 await runtime.step()
-            except Exception:
-                LOG.exception("main loop step failed; continuing in 5s")
+            except KeyboardInterrupt:
+                LOG.warning("KeyboardInterrupt received; stopping main loop")
+                runtime.stop.set()
+                break
+            except Exception as exc:
+                LOG.exception("main loop step failed; continuing in 5s: %s", exc)
                 await asyncio.sleep(5)
             await asyncio.sleep(0.25)
-
-        await runtime.pm.stop()
-        await runtime.binance.stop()
+    finally:
+        try:
+            await runtime.pm.stop()
+        except Exception:
+            LOG.exception("failed to stop PM feed")
+        try:
+            await runtime.binance.stop()
+        except Exception:
+            LOG.exception("failed to stop Binance feed")
         LOG.info("V7 stopped")
-        return 0
+
+    return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
     args = ap.parse_args()
-    return asyncio.run(amain(args.config))
+    try:
+        return asyncio.run(amain(args.config))
+    except KeyboardInterrupt:
+        print("[Main] KeyboardInterrupt; exiting cleanly", flush=True)
+        return 0
+    except Exception as exc:
+        print(f"[Main] fatal error: {exc}", flush=True)
+        return 1
 
 
 if __name__ == "__main__":
