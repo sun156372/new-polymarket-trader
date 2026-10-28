@@ -24,13 +24,16 @@ def _coerce_valid_ask(signal: Signal | None) -> float:
         print("[Error] 价格无效 signal=None", flush=True)
         raise ValueError("invalid signal")
     ask = signal.ask
+    if ask is None:
+        print(f"[Error] 拦截坏单: signal.ask is None signal={signal!r}", flush=True)
+        raise ValueError("invalid ask")
     try:
         ask_f = float(ask)
     except Exception:
         print(f"[Error] 价格无效 ask={ask!r}", flush=True)
         raise ValueError("invalid ask") from None
     if not math.isfinite(ask_f) or ask_f <= 0:
-        print(f"[Error] 价格无效 ask={ask!r}", flush=True)
+        print(f"[Error] 拦截坏单: ask is None or <= 0 ask={ask!r}", flush=True)
         raise ValueError("invalid ask")
     return ask_f
 
@@ -111,6 +114,8 @@ class PaperExecutor(BaseExecutor):
             order_id=f"paper-{int(__import__('time').time() * 1000)}",
             raw={"paper": True, "ask": ask, "slippage": self.slippage},
         )
+        if not math.isfinite(fill.entry_price) or fill.entry_price <= 0:
+            raise ValueError(f"invalid fill entry price: {fill.entry_price!r}")
         LOG.info("[Paper] BUY %s %s shares=%.4f entry=%.4f fee=%.4f cost=%.4f",
                  fill.market_slug, fill.side, shares, fill_price, fee, cost)
         return fill
@@ -121,12 +126,14 @@ class PaperExecutor(BaseExecutor):
             payout = fill.shares if won else 0.0
             cost = fill.shares * fill.entry_price + fill.fee_usdc
             pnl = payout - cost
+            if not math.isfinite(payout) or not math.isfinite(cost) or not math.isfinite(pnl):
+                raise ValueError(f"invalid settlement math: payout={payout!r} cost={cost!r} pnl={pnl!r}")
             self.balance += payout
             LOG.info("[Paper] SETTLE %s %s winner=%s won=%s payout=%.4f pnl=%+.4f",
                      fill.market_slug, fill.side, winner, won, payout, pnl)
             return pnl
-        except Exception as exc:  # 防弹衣
-            print(f"[Settle Error] market={getattr(fill, 'market_slug', 'unknown')} side={getattr(fill, 'side', 'unknown')} error={exc}", flush=True)
+        except Exception as e:  # 防弹衣，必须清理坏单
+            print(f"[Settle Error] 清理坏账: {e}", flush=True)
             return 0.0
 
 
@@ -203,6 +210,8 @@ class LiveExecutor(BaseExecutor):
             fee_usdc=fee, order_id=str(resp.get("orderID") or resp.get("orderId") or ""),
             raw=resp,
         )
+        if not math.isfinite(fill.entry_price) or fill.entry_price <= 0:
+            raise ValueError(f"invalid fill entry price: {fill.entry_price!r}")
         LOG.info("[LIVE] BUY %s %s shares=%.4f entry=%.4f order=%s",
                  fill.market_slug, fill.side, shares, entry, fill.order_id)
         return fill
