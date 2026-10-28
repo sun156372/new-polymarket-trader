@@ -32,6 +32,9 @@ EPS = 1e-9
 
 
 def _valid_ask(ask: float | None) -> float | None:
+    """strict validation: reject None, NaN, inf, <=0."""
+    if ask is None:
+        return None
     try:
         value = float(ask)
     except Exception:
@@ -127,6 +130,16 @@ def _gate(reason: str) -> None:
     print(f"[Gate拦截] 原因={reason}", flush=True)
 
 
+def _reject_bad_signal(market: Market, ask: float | None, reason: str) -> None:
+    """Common guard: no bad ask can leave this function."""
+    if ask is None or not math.isfinite(float(ask)) or float(ask) <= 0:
+        print(
+            f"[Error] 拦截坏单: market={market.slug} reason={reason} ask={ask!r}",
+            flush=True,
+        )
+        return None
+
+
 class V6Strategy:
     def __init__(self, params: V6Params):
         self.p = params
@@ -203,8 +216,11 @@ class V6Strategy:
                 ask = down_ask
 
             ask = _valid_ask(ask)
-            if ask is None:
-                print(f"[Error] 价格无效 market={market.slug} ask={ask}", flush=True)
+            if ask is None or ask <= 0:
+                print(
+                    f"[Error] 拦截坏单: market={market.slug} force_trade_test bad ask={ask!r}",
+                    flush=True,
+                )
                 return None
 
             bid = up_book.best_bid if side == "UP" else down_book.best_bid
@@ -272,8 +288,11 @@ class V6Strategy:
             return None
 
         ask = _valid_ask(ask)
-        if ask is None:
-            print(f"[Error] 价格无效 market={market.slug} ask={ask}", flush=True)
+        if ask is None or ask <= 0:
+            print(
+                f"[Error] 拦截坏单: market={market.slug} invalid ask after validation ask={ask!r}",
+                flush=True,
+            )
             _gate("no valid ask")
             return None
 
