@@ -92,7 +92,15 @@ class Runtime:
         self.entry_done = False
         self.paper_fill: Fill | None = None
         self.trade_id: str | None = None
+        self.paper_settle_started_ms: int | None = None
+        self.paper_settle_deadline_ms: int | None = None
         self.stop = asyncio.Event()
+
+    def _clear_paper_fill(self) -> None:
+        self.paper_fill = None
+        self.trade_id = None
+        self.paper_settle_started_ms = None
+        self.paper_settle_deadline_ms = None
 
     def _sanitize_state_on_startup(self) -> None:
         """Startup self-check: remove invalid positions with entry_price=None/<=0."""
@@ -134,6 +142,8 @@ class Runtime:
         self.entry_done = False
         self.paper_fill = None
         self.trade_id = None
+        self.paper_settle_started_ms = None
+        self.paper_settle_deadline_ms = None
 
         up = self.pm.get_tick(self.market.up_token, force_refresh=True, timeout=5.0)
         if up is not None and up.mid is not None:
@@ -285,7 +295,9 @@ class Runtime:
             )
             if self.mode == "paper":
                 self.paper_fill = fill
-            self.trade_id = trade_id
+                self.trade_id = trade_id
+                self.paper_settle_started_ms = now_ms()
+                self.paper_settle_deadline_ms = self.market.end_ms + 300_000 if self.market else None
             self.analytics.note_position_change()
             print(
                 f"[{'Paper' if self.mode == 'paper' else 'Live'}] 买入"
@@ -315,8 +327,23 @@ class Runtime:
         if now_ms() < self.market.end_ms + 15_000:
             return
 
+        if self.paper_fill is not None and self.paper_settle_deadline_ms is None:
+            self.paper_settle_deadline_ms = self.market.end_ms + 300_000
+        if self.paper_fill is not None and self.paper_settle_deadline_ms is not None:
+            if now_ms() > self.paper_settle_deadline_ms:
+                LOG.warning(
+                    "[Paper] settlement timeout market=%s; clearing stale pending fill after deadline=%s",
+                    self.market.slug,
+                    self.paper_settle_deadline_ms,
+                )
+                if self.trade_id:
+                    self.state.remove_position(self.trade_id)
+                self._clear_paper_fill()
+                return
+
         winner = await asyncio.to_thread(self.discovery.resolve, self.market.slug)
         if winner is None:
+            LOG.warning("[Paper] winner unresolved yet for market=%s; retrying later", self.market.slug)
             return
 
         if self.paper_fill is not None and self.trade_id:
@@ -330,14 +357,12 @@ class Runtime:
                     side=self.paper_fill.side,
                 )
                 self.state.remove_position(self.trade_id)
-                self.paper_fill = None
-                self.trade_id = None
+                self._clear_paper_fill()
             except Exception as e:
                 print(f"[Settle Error] 清理坏账: {e}", flush=True)
                 if self.trade_id:
                     self.state.remove_position(self.trade_id)
-                self.paper_fill = None
-                self.trade_id = None
+                self._clear_paper_fill()
 
         for p in self.state.active_positions():
             if p.market_slug == self.market.slug and p.status == "open":
@@ -370,6 +395,7 @@ class Runtime:
             if self.market is not None:
                 await self._settle_paper()
                 if self.mode == "paper" and self.paper_fill is not None:
+                    await asyncio.sleep(1.0)
                     return
             if not await self._roll_market(now):
                 await asyncio.sleep(1)
