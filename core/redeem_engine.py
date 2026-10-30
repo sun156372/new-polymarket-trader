@@ -13,6 +13,7 @@ Requires:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -80,13 +81,41 @@ def _as_list(v: Any) -> list:
     return []
 
 
-def normalize_side(x: Any) -> str | None:
-    s = str(x or "").strip().lower()
-    if s in ("up", "yes", "y", "1"):
+def _as_bool(value: Any) -> bool:
+    """Normalize booleans from Gamma API; string 'false' must stay False."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {"", "null", "none", "nan"}:
+            return False
+        if s in {"1", "true", "t", "yes", "y", "up", "winner_up", "winner-up"}:
+            return True
+        if s in {"0", "false", "f", "no", "n", "down", "winner_down", "winner-down"}:
+            return False
+    return bool(value)
+
+
+def _normalize_winner(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "UP" if value else "DOWN"
+    s = str(value).strip().lower()
+    if s in {"up", "yes", "y", "1", "true", "winner_up", "winner-up"}:
         return "UP"
-    if s in ("down", "no", "n", "0"):
+    if s in {"down", "no", "n", "0", "false", "winner_down", "winner-down"}:
         return "DOWN"
     return None
+
+
+def normalize_side(x: Any) -> str | None:
+    """Compatibility wrapper for side normalization used by redeem code."""
+    return _normalize_winner(x)
 
 
 class PolymarketResolver:
@@ -103,25 +132,73 @@ class PolymarketResolver:
             data = [data]
         if not isinstance(data, list) or not data:
             raise LookupError(f"market not found: {market_slug}")
+
         m = data[0]
-        closed = bool(m.get("closed") or m.get("resolved"))
+        closed = False
+        for key in ("closed", "resolved", "finalized", "isResolved"):
+            if key in m:
+                closed = _as_bool(m.get(key))
+                if closed:
+                    break
+        if not closed:
+            return ResolvedMarket(
+                market_slug=market_slug,
+                closed=False,
+                winner=None,
+                condition_id=m.get("conditionId") or m.get("condition_id"),
+                neg_risk=_as_bool(m.get("negRisk") or m.get("neg_risk") or False),
+                raw=m,
+            )
+
+        for key in (
+            "winningOutcome",
+            "winner",
+            "winning_outcome",
+            "winnerOutcome",
+            "winningOutcomeIndex",
+            "winnerOutcomeIndex",
+            "winningOutcomeName",
+            "winnerName",
+            "outcomeWinner",
+            "outcomeWinnerName",
+        ):
+            if key in m:
+                winner = _normalize_winner(m.get(key))
+                if winner:
+                    return ResolvedMarket(
+                        market_slug=market_slug,
+                        closed=True,
+                        winner=winner,
+                        condition_id=m.get("conditionId") or m.get("condition_id"),
+                        neg_risk=_as_bool(m.get("negRisk") or m.get("neg_risk") or False),
+                        raw=m,
+                    )
+
         outcomes = [str(x) for x in _as_list(m.get("outcomes"))]
-        prices = [str(x) for x in _as_list(m.get("outcomePrices"))]
-        winner = normalize_side(m.get("winningOutcome") or m.get("winner"))
-        if winner is None and closed and outcomes and prices:
+        prices = [float(x) for x in _as_list(m.get("outcomePrices")) if str(x).strip() not in {"", "None", "null"}]
+        if outcomes and prices and len(outcomes) == len(prices):
             try:
-                pv = [float(x) for x in prices]
-                idx = max(range(len(pv)), key=lambda i: pv[i])
-                if pv[idx] >= 0.99:
-                    winner = normalize_side(outcomes[idx])
+                idx = max(range(len(prices)), key=lambda i: prices[i])
+                if prices[idx] >= 0.99:
+                    winner = _normalize_winner(outcomes[idx])
+                    if winner:
+                        return ResolvedMarket(
+                            market_slug=market_slug,
+                            closed=True,
+                            winner=winner,
+                            condition_id=m.get("conditionId") or m.get("condition_id"),
+                            neg_risk=_as_bool(m.get("negRisk") or m.get("neg_risk") or False),
+                            raw=m,
+                        )
             except Exception:  # noqa: BLE001
                 pass
+
         return ResolvedMarket(
             market_slug=market_slug,
-            closed=closed,
-            winner=winner,
+            closed=True,
+            winner=None,
             condition_id=m.get("conditionId") or m.get("condition_id"),
-            neg_risk=bool(m.get("negRisk") or m.get("neg_risk")),
+            neg_risk=_as_bool(m.get("negRisk") or m.get("neg_risk") or False),
             raw=m,
         )
 
@@ -259,7 +336,7 @@ class PolymarketRedeemer:
 
 # --------------------------------------------------------------------------- engine
 import asyncio
-from core.state_manager import StateManager, now_ms
+from core.state_manager import now_ms
 
 
 class RedeemEngine:
@@ -350,3 +427,16 @@ class RedeemEngine:
             except asyncio.TimeoutError:
                 pass
         LOG.info("[Redeem] loop stopped")
+
+
+__all__ = [
+    "ResolvedMarket",
+    "PolymarketResolver",
+    "PolymarketRedeemer",
+    "RedeemEngine",
+    "RedeemUnavailable",
+    "normalize_side",
+]
+
+
+# End of file
