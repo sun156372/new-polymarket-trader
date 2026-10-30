@@ -324,13 +324,16 @@ class Runtime:
     async def _settle_paper(self) -> None:
         if self.mode != "paper" or not self.market:
             return
-        if now_ms() < self.market.end_ms + 15_000:
+
+        now = now_ms()
+        if now < self.market.end_ms + 15_000:
             return
 
         if self.paper_fill is not None and self.paper_settle_deadline_ms is None:
             self.paper_settle_deadline_ms = self.market.end_ms + 300_000
+
         if self.paper_fill is not None and self.paper_settle_deadline_ms is not None:
-            if now_ms() > self.paper_settle_deadline_ms:
+            if now > self.paper_settle_deadline_ms:
                 LOG.warning(
                     "[Paper] settlement timeout market=%s; clearing stale pending fill after deadline=%s",
                     self.market.slug,
@@ -343,7 +346,15 @@ class Runtime:
 
         winner = await asyncio.to_thread(self.discovery.resolve, self.market.slug)
         if winner is None:
-            LOG.warning("[Paper] winner unresolved yet for market=%s; retrying later", self.market.slug)
+            if self.paper_settle_deadline_ms is not None and now > self.paper_settle_deadline_ms:
+                LOG.warning(
+                    "[Paper] winner still unresolved after deadline market=%s deadline=%s",
+                    self.market.slug,
+                    self.paper_settle_deadline_ms,
+                )
+                if self.trade_id:
+                    self.state.remove_position(self.trade_id)
+                self._clear_paper_fill()
             return
 
         if self.paper_fill is not None and self.trade_id:
@@ -364,15 +375,12 @@ class Runtime:
                     self.state.remove_position(self.trade_id)
                 self._clear_paper_fill()
 
-        for p in self.state.active_positions():
+        for p in list(self.state.active_positions()):
             if p.market_slug == self.market.slug and p.status == "open":
                 try:
                     won = p.side.upper() == winner
                     payout = p.shares if won else 0.0
-                    cost = (
-                        p.shares * p.entry_price
-                        + p.shares * 0.07 * p.entry_price * (1 - p.entry_price)
-                    )
+                    cost = p.shares * p.entry_price + (p.shares * 0.07 * p.entry_price * (1 - p.entry_price))
                     pnl = payout - cost
                     if not math.isfinite(pnl):
                         raise ValueError(f"invalid pnl: {pnl!r}")
@@ -541,3 +549,149 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
