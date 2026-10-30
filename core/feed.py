@@ -68,6 +68,41 @@ def _levels(raw: Any) -> list[tuple[float, float]]:
     return out
 
 
+def _normalize_winner(value: Any) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if s in {"up", "yes", "y", "1", "true", "winner_up"}:
+        return "UP"
+    if s in {"down", "no", "n", "0", "false", "winner_down"}:
+        return "DOWN"
+    return None
+
+
+def _coerce_float_list(v: Any) -> list[float]:
+    out: list[float] = []
+    if v is None:
+        return out
+    if isinstance(v, list):
+        items = v
+    elif isinstance(v, str):
+        try:
+            items = json.loads(v)
+        except Exception:
+            items = [v]
+        if not isinstance(items, list):
+            items = [items]
+    else:
+        items = [v]
+
+    for x in items:
+        try:
+            out.append(float(x))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 @dataclass
 class Book:
     token_id: str
@@ -205,7 +240,7 @@ class MarketDiscovery:
                 start_ms = int(slug.rsplit("-", 1)[-1]) * 1000
                 return Market(
                     slug=slug,
-                    condition_id=str(m.get("conditionId") or ""),
+                    condition_id=str(m.get("conditionId") or m.get("condition_id") or ""),
                     up_token=str(tokens[0]),
                     down_token=str(tokens[1]),
                     start_ms=start_ms,
@@ -225,38 +260,54 @@ class MarketDiscovery:
                 data = [data]
             if not data:
                 return None
-            m = data[0]
 
-            closed = m.get("closed")
-            if closed is None:
-                closed = m.get("resolved")
-            if closed is None:
-                closed = False
-            if not bool(closed):
+            m = data[0]
+            closed = (
+                bool(m.get("closed"))
+                or bool(m.get("resolved"))
+                or bool(m.get("finalized"))
+                or bool(m.get("isResolved"))
+            )
+            if not closed:
                 return None
 
-            w = m.get("winningOutcome")
-            if w is None:
-                w = m.get("winner")
-            if w is None:
-                w = ""
-            w = str(w).lower()
-
-            if w in ("up", "yes"):
-                return "UP"
-            if w in ("down", "no"):
-                return "DOWN"
+            for key in (
+                "winningOutcome",
+                "winner",
+                "winning_outcome",
+                "winnerOutcome",
+                "winningOutcomeIndex",
+                "winnerOutcomeIndex",
+            ):
+                if key not in m:
+                    continue
+                normalized = _normalize_winner(m.get(key))
+                if normalized:
+                    return normalized
 
             outcomes = [str(x) for x in self._json_list(m.get("outcomes"))]
-            prices = self._json_list(m.get("outcomePrices"))
-            if outcomes and prices:
-                vals = [float(x) for x in prices]
-                i = max(range(len(vals)), key=lambda j: vals[j])
-                if vals[i] >= 0.99:
-                    return "UP" if outcomes[i].lower() in ("up", "yes") else "DOWN"
+            prices = _coerce_float_list(m.get("outcomePrices"))
+            if outcomes and prices and len(outcomes) == len(prices):
+                idx = max(range(len(prices)), key=lambda i: prices[i])
+                if prices[idx] >= 0.99:
+                    label = str(outcomes[idx]).lower()
+                    if label in {"up", "yes", "yes_no", "true"}:
+                        return "UP"
+                    if label in {"down", "no", "false"}:
+                        return "DOWN"
+
+            for key in ("winningOutcomeName", "winnerName", "outcomeWinner", "outcomeWinnerName"):
+                if key not in m:
+                    continue
+                normalized = _normalize_winner(m.get(key))
+                if normalized:
+                    return normalized
+
+            return None
+
         except Exception as exc:  # noqa: BLE001
             LOG.warning("resolve %s: %s", slug, exc)
-        return None
+            return None
 
 
 class PolymarketFeed:
@@ -348,7 +399,6 @@ class PolymarketFeed:
             print(f"[REST Fallback] Unexpected response shape for token={token}: {type(data).__name__}", flush=True)
             return None
 
-        # 显式 None 判断，绝不使用 `or` 串联 dict.get()
         bids = data.get("bids")
         if bids is None:
             bids = data.get("buys")
@@ -523,13 +573,11 @@ class PolymarketFeed:
                     changes = []
 
                 if not changes and m.get("price") is not None:
-                    changes = [
-                        {
-                            "price": m.get("price"),
-                            "size": m.get("size"),
-                            "side": m.get("side"),
-                        }
-                    ]
+                    changes = [{
+                        "price": m.get("price"),
+                        "size": m.get("size"),
+                        "side": m.get("side"),
+                    }]
 
                 for c in changes:
                     try:
@@ -635,7 +683,6 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
         print(f"[REST Fallback] Unexpected response shape for token={token_id}: {type(data).__name__}", flush=True)
         return False
 
-    # 显式 None 判断，绝不使用 `or` 串联 dict.get()
     bids = data.get("bids")
     if bids is None:
         bids = data.get("buys")
@@ -689,3 +736,546 @@ __all__ = [
     "now_ms",
     "try_refresh_book_snapshot",
 ]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+author": "sun156372"
+"}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
