@@ -332,30 +332,24 @@ class Runtime:
         if self.paper_fill is not None and self.paper_settle_deadline_ms is None:
             self.paper_settle_deadline_ms = self.market.end_ms + 300_000
 
-        if self.paper_fill is not None and self.paper_settle_deadline_ms is not None:
-            if now > self.paper_settle_deadline_ms:
-                LOG.warning(
-                    "[Paper] settlement timeout market=%s; clearing stale pending fill after deadline=%s",
-                    self.market.slug,
-                    self.paper_settle_deadline_ms,
-                )
-                if self.trade_id:
-                    self.state.remove_position(self.trade_id)
-                self._clear_paper_fill()
-                return
+        hard_deadline_ms = self.paper_settle_deadline_ms or (self.market.end_ms + 300_000)
 
-        winner = await asyncio.to_thread(self.discovery.resolve, self.market.slug)
-        if winner is None:
-            if self.paper_settle_deadline_ms is not None and now > self.paper_settle_deadline_ms:
+        winner = None
+        if now < hard_deadline_ms:
+            winner = await asyncio.to_thread(self.discovery.resolve, self.market.slug)
+            if winner is None:
+                return
+        else:
+            winner = await asyncio.to_thread(self.discovery.resolve, self.market.slug)
+            if winner is None:
                 LOG.warning(
-                    "[Paper] winner still unresolved after deadline market=%s deadline=%s",
+                    "[Paper] winner still unresolved at hard deadline market=%s; preserving position for manual review",
                     self.market.slug,
-                    self.paper_settle_deadline_ms,
                 )
-                if self.trade_id:
-                    self.state.remove_position(self.trade_id)
-                self._clear_paper_fill()
-            return
+                for p in list(self.state.active_positions()):
+                    if p.market_slug == self.market.slug and p.status in {"open", "unresolved"}:
+                        self.state.update_position(p.trade_id, status="unresolved")
+                return
 
         if self.paper_fill is not None and self.trade_id:
             try:
@@ -372,11 +366,11 @@ class Runtime:
             except Exception as e:
                 print(f"[Settle Error] 清理坏账: {e}", flush=True)
                 if self.trade_id:
-                    self.state.remove_position(self.trade_id)
+                    self.state.update_position(self.trade_id, status="unresolved")
                 self._clear_paper_fill()
 
         for p in list(self.state.active_positions()):
-            if p.market_slug == self.market.slug and p.status == "open":
+            if p.market_slug == self.market.slug and p.status in {"open", "unresolved"}:
                 try:
                     won = p.side.upper() == winner
                     payout = p.shares if won else 0.0
@@ -394,7 +388,7 @@ class Runtime:
                     self.state.remove_position(p.trade_id)
                 except Exception as e:
                     print(f"[Settle Error] 清理坏账: {e}", flush=True)
-                    self.state.remove_position(p.trade_id)
+                    self.state.update_position(p.trade_id, status="unresolved")
 
     async def step(self) -> None:
         now = now_ms()
@@ -549,149 +543,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
