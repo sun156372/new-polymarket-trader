@@ -111,6 +111,7 @@ def _normalize_winner(value: Any) -> str | None:
             "value",
             "name",
             "label",
+            "side",
         ):
             if key in value:
                 w = _normalize_winner(value.get(key))
@@ -469,12 +470,6 @@ class MarketDiscovery:
         return None
 
     def resolve(self, slug: str, retries: int = 6, backoff_s: float = 1.5) -> str | None:
-        """
-        Robust winner resolution:
-        - retry Gamma queries
-        - support multiple payload shapes
-        - do not assume None means final loser
-        """
         last_err = None
         for attempt in range(retries):
             try:
@@ -723,6 +718,11 @@ class PolymarketFeed:
         winner = self._extract_event_winner(msg)
         if winner is None:
             return
+
+        for key in ("slug", "market_slug", "marketSlug", "market_name", "marketName"):
+            val = msg.get(key)
+            if val:
+                self.market_resolution_cache[str(val)] = winner
 
         condition_id = str(
             msg.get("condition_id")

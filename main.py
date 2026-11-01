@@ -133,7 +133,12 @@ class Runtime:
         keys = []
         if self.market.condition_id:
             keys.append(self.market.condition_id)
-        keys.extend([self.market.slug, self.market.up_token, self.market.down_token])
+        keys.extend([
+            self.market.slug,
+            getattr(self.market, "slug", ""),
+            self.market.up_token,
+            self.market.down_token,
+        ])
 
         seen: set[str] = set()
         for key in keys:
