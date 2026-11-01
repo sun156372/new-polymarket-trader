@@ -153,6 +153,21 @@ class Runtime:
                 return val
         return None
 
+    def _candidate_market_slugs(self) -> list[str]:
+        if self.market is None:
+            return []
+        base = self.market.slug
+        slugs = [base]
+        try:
+            stamp = int(base.rsplit("-", 1)[-1])
+        except Exception:
+            return slugs
+        for offset in (-1, 1, -2, 2):
+            candidate = f"btc-updown-5m-{stamp + offset * 300}"
+            if candidate not in slugs:
+                slugs.append(candidate)
+        return slugs
+
     async def _resolve_market_winner(self) -> tuple[str | None, str]:
         """Best-effort final winner resolution with WS + Gamma fallback."""
         if self.market is None:
@@ -162,12 +177,13 @@ class Runtime:
         if cached in {"UP", "DOWN"}:
             return cached, "ws-cache"
 
-        try:
-            winner = await asyncio.to_thread(self.discovery.resolve, self.market.slug)
-            if winner in {"UP", "DOWN"}:
-                return winner, "gamma"
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("[Resolve] gamma resolve failed market=%s err=%s", self.market.slug, exc)
+        for slug in self._candidate_market_slugs():
+            try:
+                winner = await asyncio.to_thread(self.discovery.resolve, slug)
+                if winner in {"UP", "DOWN"}:
+                    return winner, f"gamma:{slug}"
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("[Resolve] gamma resolve failed market=%s err=%s", slug, exc)
 
         if self.market.condition_id:
             try:
