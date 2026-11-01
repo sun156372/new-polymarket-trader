@@ -8,6 +8,7 @@ Design rules:
   * REST fallback is forced whenever a book is not ready, so the strategy never
     silently starves on missing WebSocket book updates
   * All token IDs are preserved as full strings; no silent truncation
+  * winner resolution is resilient: retry + multi-field extraction + no destructive clear
 """
 from __future__ import annotations
 
@@ -237,9 +238,73 @@ class MarketDiscovery:
         return token
 
     @staticmethod
+    def _normalize_winner(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return "UP" if value else "DOWN"
+        s = str(value).strip().lower()
+        if s in {"up", "yes", "y", "1", "true", "winner_up", "winner-up"}:
+            return "UP"
+        if s in {"down", "no", "n", "0", "false", "winner_down", "winner-down"}:
+            return "DOWN"
+        return None
+
+    @staticmethod
     def slug_for(now: int) -> tuple[str, int]:
         start_s = (now // 300_000) * 300
         return f"btc-updown-5m-{start_s}", start_s * 1000
+
+    def _extract_winner_from_market(self, m: dict) -> str | None:
+        if not isinstance(m, dict):
+            return None
+
+        # explicit winner fields
+        for key in (
+            "winningOutcome",
+            "winner",
+            "winning_outcome",
+            "winnerOutcome",
+            "winningOutcomeIndex",
+            "winnerOutcomeIndex",
+            "winningOutcomeName",
+            "winnerName",
+            "outcomeWinner",
+            "outcomeWinnerName",
+            "result",
+            "result_name",
+            "winning_outcome_name",
+        ):
+            if key in m:
+                w = self._normalize_winner(m.get(key))
+                if w:
+                    return w
+
+        outcomes = [str(x) for x in self._json_list(m.get("outcomes"))]
+        prices = []
+        for x in self._json_list(m.get("outcomePrices")):
+            try:
+                prices.append(float(x))
+            except Exception:
+                continue
+
+        if outcomes and prices and len(outcomes) == len(prices):
+            try:
+                idx = max(range(len(prices)), key=lambda i: float(prices[i]))
+                if float(prices[idx]) >= 0.99:
+                    w = self._normalize_winner(outcomes[idx])
+                    if w:
+                        return w
+            except Exception:
+                pass
+
+        for key in ("finalAnswer", "final_answer", "finalOutcome", "final_outcome"):
+            if key in m:
+                w = self._normalize_winner(m.get(key))
+                if w:
+                    return w
+
+        return None
 
     def fetch(self, slug: str, retries: int = 5) -> Market | None:
         url = f"{self.gamma_url}/markets?slug={urllib.parse.quote(slug)}"
@@ -275,55 +340,66 @@ class MarketDiscovery:
                 time.sleep(min(2 ** attempt, 8))
         return None
 
-    def resolve(self, slug: str) -> str | None:
-        try:
-            data = self._get_json(f"{self.gamma_url}/markets?slug={urllib.parse.quote(slug)}")
-            if isinstance(data, dict):
-                data = [data]
-            if not data:
-                return None
+    def resolve(self, slug: str, retries: int = 6, backoff_s: float = 1.5) -> str | None:
+        """
+        Robust winner resolution:
+        - retry Gamma queries
+        - support multiple payload shapes
+        - do not assume None means final loser
+        """
+        last_err = None
+        for attempt in range(retries):
+            try:
+                url = f"{self.gamma_url}/markets?slug={urllib.parse.quote(slug)}"
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": "v7-resolve/1.0",
+                        "Accept": "application/json",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    data = json.loads(r.read().decode("utf-8"))
 
-            m = data[0]
-            closed = False
-            for key in ("closed", "resolved", "finalized", "isResolved"):
-                if key in m:
-                    closed = _as_bool(m.get(key))
-                    if closed:
-                        break
-            if not closed:
-                return None
+                if isinstance(data, dict):
+                    data = [data]
+                if not isinstance(data, list) or not data:
+                    last_err = ValueError("empty or invalid gamma payload")
+                    if attempt < retries - 1:
+                        time.sleep(backoff_s * (attempt + 1))
+                        continue
+                    return None
 
-            for key in (
-                "winningOutcome",
-                "winner",
-                "winning_outcome",
-                "winnerOutcome",
-                "winningOutcomeIndex",
-                "winnerOutcomeIndex",
-                "winningOutcomeName",
-                "winnerName",
-                "outcomeWinner",
-                "outcomeWinnerName",
-            ):
-                if key in m:
-                    normalized = _normalize_winner(m.get(key))
-                    if normalized:
-                        return normalized
+                for m in data:
+                    if not isinstance(m, dict):
+                        continue
 
-            outcomes = [str(x) for x in self._json_list(m.get("outcomes"))]
-            prices = _coerce_float_list(m.get("outcomePrices"))
-            if outcomes and prices and len(outcomes) == len(prices):
-                idx = max(range(len(prices)), key=lambda i: float(prices[i]))
-                if float(prices[idx]) >= 0.99:
-                    normalized = _normalize_winner(outcomes[idx])
-                    if normalized:
-                        return normalized
+                    closed = False
+                    for key in ("closed", "resolved", "finalized", "isResolved", "is_resolved"):
+                        if key in m:
+                            try:
+                                closed = bool(m.get(key))
+                            except Exception:
+                                closed = False
+                            if closed:
+                                break
 
-            return None
+                    if not closed:
+                        continue
 
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("resolve %s: %s", slug, exc)
-            return None
+                    winner = self._extract_winner_from_market(m)
+                    if winner:
+                        return winner
+                last_err = ValueError("no final winner in gamma payload")
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                LOG.warning("resolve %s attempt=%d failed: %s", slug, attempt + 1, exc)
+
+            if attempt < retries - 1:
+                time.sleep(backoff_s * (attempt + 1))
+
+        LOG.warning("resolve %s unresolved after retries: %s", slug, last_err)
+        return None
 
 
 class PolymarketFeed:
