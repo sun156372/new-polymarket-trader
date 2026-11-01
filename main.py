@@ -130,27 +130,22 @@ class Runtime:
         if self.market is None:
             return None
 
-        candidates = []
+        keys = []
         if self.market.condition_id:
-            candidates.append(self.market.condition_id)
-        candidates.append(self.market.slug)
-        candidates.extend([self.market.up_token, self.market.down_token])
+            keys.append(self.market.condition_id)
+        keys.extend([self.market.slug, self.market.up_token, self.market.down_token])
 
         seen: set[str] = set()
-        for key in candidates:
+        for key in keys:
             if not key or key in seen:
                 continue
             seen.add(key)
-            val = self.pm.market_resolution_cache.get(str(key))
-            if val in {"UP", "DOWN"}:
-                return val
-
-        for token in (self.market.up_token, self.market.down_token):
-            if not token:
-                continue
-            val = self.pm.asset_resolution_cache.get(str(token))
-            if val in {"UP", "DOWN"}:
-                return val
+            value = self.pm.market_resolution_cache.get(str(key))
+            if value in {"UP", "DOWN"}:
+                return value
+            value = self.pm.asset_resolution_cache.get(str(key))
+            if value in {"UP", "DOWN"}:
+                return value
         return None
 
     async def _resolve_market_winner(self) -> tuple[str | None, str]:
@@ -162,12 +157,16 @@ class Runtime:
         if cached in {"UP", "DOWN"}:
             return cached, "ws-cache"
 
+        winner = None
+        source = "unresolved"
         try:
             winner = await asyncio.to_thread(self.discovery.resolve, self.market.slug)
             if winner in {"UP", "DOWN"}:
                 return winner, "gamma"
+            source = "gamma-unresolved"
         except Exception as exc:  # noqa: BLE001
             LOG.warning("[Resolve] gamma resolve failed market=%s err=%s", self.market.slug, exc)
+            source = "gamma-exception"
 
         if self.market.condition_id:
             try:
@@ -177,7 +176,7 @@ class Runtime:
             except Exception:
                 pass
 
-        return None, "unresolved"
+        return None, source
 
     async def _roll_market(self, now: int) -> bool:
         slug, _ = MarketDiscovery.slug_for(now)

@@ -92,12 +92,47 @@ def _normalize_winner(value: Any) -> str | None:
     """Normalize Polymarket winner labels to UP/DOWN across API variants."""
     if value is None:
         return None
+    if isinstance(value, dict):
+        for key in (
+            "winner",
+            "winningOutcome",
+            "winning_outcome",
+            "outcome",
+            "result",
+            "winnerName",
+            "winningOutcomeName",
+            "finalOutcome",
+            "final_outcome",
+            "outcomeWinner",
+            "winningAssetId",
+            "winning_asset_id",
+            "winnerAssetId",
+            "winner_asset_id",
+            "value",
+            "name",
+            "label",
+        ):
+            if key in value:
+                w = _normalize_winner(value.get(key))
+                if w:
+                    return w
+        for child in value.values():
+            w = _normalize_winner(child)
+            if w:
+                return w
+        return None
+    if isinstance(value, list):
+        for item in value:
+            w = _normalize_winner(item)
+            if w:
+                return w
+        return None
     if isinstance(value, bool):
         return "UP" if value else "DOWN"
     s = str(value).strip().lower()
-    if s in {"up", "yes", "y", "1", "true", "winner_up", "winner-up", "up_token", "winner-token-up"}:
+    if s in {"up", "yes", "y", "1", "true", "winner_up", "winner-up", "up_token", "winner-token-up", "yes_token", "winner_token_up"}:
         return "UP"
-    if s in {"down", "no", "n", "0", "false", "winner_down", "winner-down", "down_token", "winner-token-down"}:
+    if s in {"down", "no", "n", "0", "false", "winner_down", "winner-down", "down_token", "winner-token-down", "no_token", "winner_token_down"}:
         return "DOWN"
     return None
 
@@ -331,6 +366,10 @@ class MarketDiscovery:
             if not resolved_flag and not status:
                 return None
 
+        winner = cls._normalize_winner(m)
+        if winner:
+            return winner
+
         outcome_names: list[str] = []
         outcomes_raw = cls._json_list(m.get("outcomes"))
         if outcomes_raw:
@@ -450,8 +489,6 @@ class MarketDiscovery:
                 with urllib.request.urlopen(req, timeout=self.timeout) as r:
                     data = json.loads(r.read().decode("utf-8"))
 
-                if isinstance(data, dict):
-                    data = [data]
                 if isinstance(data, dict):
                     data = [data]
                 if not isinstance(data, list) or not data:
@@ -683,55 +720,7 @@ class PolymarketFeed:
         if not isinstance(msg, dict):
             return
 
-        winner = None
-        for key in (
-            "winner",
-            "winningOutcome",
-            "winning_outcome",
-            "result",
-            "winningOutcomeName",
-            "winnerName",
-            "finalOutcome",
-            "final_outcome",
-            "outcomeWinner",
-            "winningAssetId",
-            "winning_asset_id",
-            "winnerAssetId",
-            "winner_asset_id",
-            "winning_asset",
-            "winner_asset",
-        ):
-            if key in msg:
-                winner = self._normalize_event_winner(msg.get(key))
-                if winner:
-                    break
-
-        if winner is None:
-            for key in ("payload", "market", "data"):
-                node = msg.get(key)
-                if isinstance(node, dict):
-                    if node.get("winner") is not None:
-                        winner = self._normalize_event_winner(node.get("winner"))
-                    elif node.get("winningOutcome") is not None:
-                        winner = self._normalize_event_winner(node.get("winningOutcome"))
-                    if winner:
-                        break
-
-        if winner is None:
-            market_id = str(
-                msg.get("condition_id")
-                or msg.get("conditionId")
-                or msg.get("market_id")
-                or msg.get("marketId")
-                or msg.get("id")
-                or ""
-            )
-            if not market_id:
-                return
-            if msg.get("marketStatus") is not None or msg.get("status") is not None:
-                if str(msg.get("marketStatus") or msg.get("status") or "").lower() in {"resolved", "closed", "finalized", "settled"}:
-                    winner = self._normalize_event_winner(msg.get("winner")) or self._normalize_event_winner(msg.get("result"))
-
+        winner = self._extract_event_winner(msg)
         if winner is None:
             return
 
@@ -746,7 +735,14 @@ class PolymarketFeed:
         if condition_id:
             self.market_resolution_cache[condition_id] = winner
 
-        winning_asset_id = msg.get("winning_asset_id") or msg.get("winningAssetId") or msg.get("winner_asset_id") or msg.get("winnerAssetId")
+        winning_asset_id = (
+            msg.get("winning_asset_id")
+            or msg.get("winningAssetId")
+            or msg.get("winner_asset_id")
+            or msg.get("winnerAssetId")
+            or msg.get("winning_asset")
+            or msg.get("winner_asset")
+        )
         if winning_asset_id:
             self.asset_resolution_cache[str(winning_asset_id)] = winner
 
@@ -786,6 +782,10 @@ class PolymarketFeed:
                 w = self._extract_event_winner(node)
                 if w:
                     return w
+        if isinstance(msg, dict):
+            w = self._normalize_event_winner(msg)
+            if w:
+                return w
         return None
 
     async def subscribe(self, tokens: Iterable[str]) -> None:
@@ -1088,3 +1088,5 @@ __all__ = [
     "now_ms",
     "try_refresh_book_snapshot",
 ]
+
+# End of file
