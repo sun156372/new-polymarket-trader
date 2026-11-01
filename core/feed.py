@@ -256,10 +256,11 @@ class MarketDiscovery:
         return f"btc-updown-5m-{start_s}", start_s * 1000
 
     def _extract_winner_from_market(self, m: dict) -> str | None:
+        """Extract the winner from different Gamma payload shapes."""
         if not isinstance(m, dict):
             return None
 
-        # explicit winner fields
+        # 1) Direct winner fields
         for key in (
             "winningOutcome",
             "winner",
@@ -274,35 +275,89 @@ class MarketDiscovery:
             "result",
             "result_name",
             "winning_outcome_name",
+            "finalAnswer",
+            "final_answer",
+            "finalOutcome",
+            "final_outcome",
+            "resolution",
         ):
             if key in m:
                 w = self._normalize_winner(m.get(key))
                 if w:
                     return w
 
-        outcomes = [str(x) for x in self._json_list(m.get("outcomes"))]
-        prices = []
-        for x in self._json_list(m.get("outcomePrices")):
-            try:
-                prices.append(float(x))
-            except Exception:
-                continue
+        # 2) status string compatibility: status="closed" or marketStatus="resolved"
+        status = str(
+            m.get("status")
+            or m.get("marketStatus")
+            or m.get("market_status")
+            or ""
+        ).lower()
 
-        if outcomes and prices and len(outcomes) == len(prices):
+        if status not in {
+            "closed",
+            "resolved",
+            "finalized",
+            "settled",
+            "finalized_by_oracle",
+        }:
+            resolved_flag = any(
+                bool(m.get(k))
+                for k in (
+                    "closed",
+                    "resolved",
+                    "finalized",
+                    "isResolved",
+                    "is_resolved",
+                    "isFinalized",
+                    "is_finalized",
+                )
+                if k in m
+            )
+            if not resolved_flag and not status:
+                return None
+
+        # 3) outcomes + outcomePrices / prices mapping
+        outcome_names: list[str] = []
+        outcomes_raw = self._json_list(m.get("outcomes"))
+        if outcomes_raw:
+            for raw in outcomes_raw:
+                if isinstance(raw, dict):
+                    name = (
+                        raw.get("name")
+                        or raw.get("label")
+                        or raw.get("outcome")
+                        or raw.get("title")
+                    )
+                    if name is not None:
+                        outcome_names.append(str(name))
+                else:
+                    outcome_names.append(str(raw))
+
+        prices = self._coerce_float_list(
+            m.get("outcomePrices") or m.get("prices") or m.get("outcome_prices")
+        )
+
+        if outcome_names and prices and len(outcome_names) == len(prices):
             try:
                 idx = max(range(len(prices)), key=lambda i: float(prices[i]))
-                if float(prices[idx]) >= 0.99:
-                    w = self._normalize_winner(outcomes[idx])
-                    if w:
-                        return w
+                w = self._normalize_winner(outcome_names[idx])
+                if w:
+                    return w
             except Exception:
                 pass
 
-        for key in ("finalAnswer", "final_answer", "finalOutcome", "final_outcome"):
+        # 4) winningIndex / winnerIndex compatibility
+        for key in ("winningIndex", "winnerIndex", "winning_index", "winner_index"):
             if key in m:
-                w = self._normalize_winner(m.get(key))
-                if w:
-                    return w
+                try:
+                    idx = int(m.get(key))
+                    if idx >= 0 and outcome_names and idx < len(outcome_names):
+                        w = self._normalize_winner(outcome_names[idx])
+                        if w:
+                            return w
+                except Exception:
+                    pass
 
         return None
 
@@ -374,22 +429,44 @@ class MarketDiscovery:
                     if not isinstance(m, dict):
                         continue
 
-                    closed = False
-                    for key in ("closed", "resolved", "finalized", "isResolved", "is_resolved"):
-                        if key in m:
-                            try:
-                                closed = bool(m.get(key))
-                            except Exception:
-                                closed = False
-                            if closed:
-                                break
+                    # New logic: resolve via status OR boolean finalization fields
+                    status = str(
+                        m.get("status")
+                        or m.get("marketStatus")
+                        or m.get("market_status")
+                        or ""
+                    ).lower()
 
-                    if not closed:
+                    resolved = status in {
+                        "closed",
+                        "resolved",
+                        "finalized",
+                        "settled",
+                        "finalized_by_oracle",
+                    }
+
+                    if not resolved:
+                        resolved = any(
+                            bool(m.get(k))
+                            for k in (
+                                "closed",
+                                "resolved",
+                                "finalized",
+                                "isResolved",
+                                "is_resolved",
+                                "isFinalized",
+                                "is_finalized",
+                            )
+                            if k in m
+                        )
+
+                    if not resolved:
                         continue
 
                     winner = self._extract_winner_from_market(m)
                     if winner:
                         return winner
+
                 last_err = ValueError("no final winner in gamma payload")
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
