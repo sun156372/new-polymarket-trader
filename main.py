@@ -126,6 +126,59 @@ class Runtime:
         if cleaned:
             LOG.warning("[State] removed %d invalid position(s) at startup", cleaned)
 
+    def _resolve_winner_from_ws_cache(self) -> str | None:
+        if self.market is None:
+            return None
+
+        candidates = []
+        if self.market.condition_id:
+            candidates.append(self.market.condition_id)
+        candidates.append(self.market.slug)
+        candidates.extend([self.market.up_token, self.market.down_token])
+
+        seen: set[str] = set()
+        for key in candidates:
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            val = self.pm.market_resolution_cache.get(str(key))
+            if val in {"UP", "DOWN"}:
+                return val
+
+        for token in (self.market.up_token, self.market.down_token):
+            if not token:
+                continue
+            val = self.pm.asset_resolution_cache.get(str(token))
+            if val in {"UP", "DOWN"}:
+                return val
+        return None
+
+    async def _resolve_market_winner(self) -> tuple[str | None, str]:
+        """Best-effort final winner resolution with WS + Gamma fallback."""
+        if self.market is None:
+            return None, "no-market"
+
+        cached = self._resolve_winner_from_ws_cache()
+        if cached in {"UP", "DOWN"}:
+            return cached, "ws-cache"
+
+        try:
+            winner = await asyncio.to_thread(self.discovery.resolve, self.market.slug)
+            if winner in {"UP", "DOWN"}:
+                return winner, "gamma"
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("[Resolve] gamma resolve failed market=%s err=%s", self.market.slug, exc)
+
+        if self.market.condition_id:
+            try:
+                winner = await asyncio.to_thread(self.discovery.resolve, self.market.slug)
+                if winner in {"UP", "DOWN"}:
+                    return winner, "gamma-retry"
+            except Exception:
+                pass
+
+        return None, "unresolved"
+
     async def _roll_market(self, now: int) -> bool:
         slug, _ = MarketDiscovery.slug_for(now)
         if self.market and self.market.slug == slug:
@@ -334,22 +387,20 @@ class Runtime:
 
         hard_deadline_ms = self.paper_settle_deadline_ms or (self.market.end_ms + 300_000)
 
-        winner = None
-        if now < hard_deadline_ms:
-            winner = await asyncio.to_thread(self.discovery.resolve, self.market.slug)
-            if winner is None:
-                return
-        else:
-            winner = await asyncio.to_thread(self.discovery.resolve, self.market.slug)
-            if winner is None:
+        winner, source = await self._resolve_market_winner()
+
+        if winner is None:
+            if now >= hard_deadline_ms:
                 LOG.warning(
-                    "[Paper] winner still unresolved at hard deadline market=%s; preserving position for manual review",
+                    "[Paper] winner still unresolved at hard deadline market=%s, source=%s; preserving position for manual review",
                     self.market.slug,
+                    source,
                 )
                 for p in list(self.state.active_positions()):
-                    if p.market_slug == self.market.slug and p.status in {"open", "unresolved"}:
-                        self.state.update_position(p.trade_id, status="unresolved")
+                    if p.market_slug == self.market.slug and p.status in {"open", "pending_fill", "unresolved"}:
+                        self.state.update_position(p.trade_id, status="unresolved", last_error="winner unresolved")
                 return
+            return
 
         if self.paper_fill is not None and self.trade_id:
             try:
@@ -366,11 +417,11 @@ class Runtime:
             except Exception as e:
                 print(f"[Settle Error] 清理坏账: {e}", flush=True)
                 if self.trade_id:
-                    self.state.update_position(self.trade_id, status="unresolved")
+                    self.state.update_position(self.trade_id, status="unresolved", last_error=f"settle: {type(e).__name__}: {e}")
                 self._clear_paper_fill()
 
         for p in list(self.state.active_positions()):
-            if p.market_slug == self.market.slug and p.status in {"open", "unresolved"}:
+            if p.market_slug == self.market.slug and p.status in {"open", "pending_fill", "unresolved"}:
                 try:
                     won = p.side.upper() == winner
                     payout = p.shares if won else 0.0
@@ -388,7 +439,7 @@ class Runtime:
                     self.state.remove_position(p.trade_id)
                 except Exception as e:
                     print(f"[Settle Error] 清理坏账: {e}", flush=True)
-                    self.state.update_position(p.trade_id, status="unresolved")
+                    self.state.update_position(p.trade_id, status="unresolved", last_error=f"settle: {type(e).__name__}: {e}")
 
     async def step(self) -> None:
         now = now_ms()
