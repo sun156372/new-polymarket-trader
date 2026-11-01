@@ -9,7 +9,7 @@ Design rules:
     silently starves on missing WebSocket book updates
   * All token IDs are preserved as full strings; no silent truncation
   * winner resolution is resilient: retry + multi-field extraction + no destructive clear
-"""
+ """
 from __future__ import annotations
 
 import asyncio
@@ -92,8 +92,35 @@ def _normalize_winner(value: Any) -> str | None:
     """Normalize Polymarket winner labels to UP/DOWN across API variants."""
     if value is None:
         return None
+    if isinstance(value, dict):
+        for key in ("value", "name", "label", "outcome", "winner", "winningOutcome", "result"):
+            if key in value:
+                w = _normalize_winner(value.get(key))
+                if w:
+                    return w
+        for key in ("index", "idx"):
+            if key in value:
+                try:
+                    idx = int(value.get(key))
+                except Exception:  # noqa: BLE001
+                    idx = None
+                if idx == 0:
+                    return "DOWN"
+                if idx == 1:
+                    return "UP"
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            w = _normalize_winner(item)
+            if w:
+                return w
     if isinstance(value, bool):
         return "UP" if value else "DOWN"
+    if isinstance(value, (int, float)):
+        if value == 1:
+            return "UP"
+        if value == 0:
+            return "DOWN"
+        return None
     s = str(value).strip().lower()
     if s in {"up", "yes", "y", "1", "true", "winner_up", "winner-up", "up_token", "winner-token-up"}:
         return "UP"
@@ -259,13 +286,23 @@ class MarketDiscovery:
             return str(value)
         return None
 
+    @staticmethod
+    def _winner_from_index(index: Any, outcome_names: list[str]) -> str | None:
+        try:
+            idx = int(index)
+        except Exception:  # noqa: BLE001
+            return None
+        if idx < 0 or idx >= len(outcome_names):
+            return None
+        return _normalize_winner(outcome_names[idx])
+
     @classmethod
     def _extract_winner_from_market(cls, m: dict) -> str | None:
-        """Extract the winner from different Gamma payload shapes."""
+        """Extract the winner from different Gamma payload shapes without recursive blow-ups."""
         if not isinstance(m, dict):
             return None
 
-        for key in (
+        winner_keys = (
             "winningOutcome",
             "winner",
             "winning_outcome",
@@ -292,18 +329,13 @@ class MarketDiscovery:
             "winner_token_id",
             "winnerAsset",
             "winningAsset",
-        ):
-            if key in m:
-                w = cls._normalize_winner(m.get(key))
-                if w:
-                    return w
+        )
 
-        for key in ("market", "payload", "data", "result_payload"):
-            node = m.get(key)
-            if isinstance(node, dict):
-                w = cls._extract_winner_from_market(node)
-                if w:
-                    return w
+        for key in winner_keys:
+            if key in m:
+                winner = cls._normalize_winner(m.get(key))
+                if winner:
+                    return winner
 
         status = str(
             m.get("status")
@@ -312,8 +344,16 @@ class MarketDiscovery:
             or m.get("resolutionStatus")
             or ""
         ).lower()
-        if status not in {"closed", "resolved", "finalized", "settled", "finalized_by_oracle", "resolved_by_oracle"}:
-            resolved_flag = any(
+        resolved = status in {
+            "closed",
+            "resolved",
+            "finalized",
+            "settled",
+            "finalized_by_oracle",
+            "resolved_by_oracle",
+        }
+        if not resolved:
+            resolved = any(
                 bool(m.get(k))
                 for k in (
                     "closed",
@@ -328,30 +368,25 @@ class MarketDiscovery:
                 )
                 if k in m
             )
-            if not resolved_flag and not status:
-                return None
 
         outcome_names: list[str] = []
         outcomes_raw = cls._json_list(m.get("outcomes"))
+        if not outcomes_raw:
+            outcomes_raw = cls._json_list(m.get("outcomeNames"))
         if outcomes_raw:
             for raw in outcomes_raw:
                 if isinstance(raw, dict):
-                    name = (
-                        raw.get("name")
-                        or raw.get("label")
-                        or raw.get("outcome")
-                        or raw.get("title")
-                        or raw.get("value")
-                    )
-                    name_s = cls._pick_outcome_name(name)
-                    if name_s:
-                        outcome_names.append(str(name_s))
+                    for key in ("name", "label", "outcome", "title", "value"):
+                        name_s = cls._pick_outcome_name(raw.get(key))
+                        if name_s:
+                            outcome_names.append(str(name_s))
+                            break
                 else:
                     name_s = cls._pick_outcome_name(raw)
                     if name_s:
                         outcome_names.append(str(name_s))
 
-        prices = cls._coerce_float_list(
+        prices = _coerce_float_list(
             m.get("outcomePrices")
             or m.get("prices")
             or m.get("outcome_prices")
@@ -362,28 +397,66 @@ class MarketDiscovery:
         if outcome_names and prices and len(outcome_names) == len(prices):
             try:
                 idx = max(range(len(prices)), key=lambda i: float(prices[i]))
-                w = cls._normalize_winner(outcome_names[idx])
-                if w:
-                    return w
-            except Exception:
+                winner = cls._normalize_winner(outcome_names[idx])
+                if winner:
+                    return winner
+            except Exception:  # noqa: BLE001
                 pass
 
         for key in ("winningIndex", "winnerIndex", "winning_index", "winner_index"):
             if key in m:
-                try:
-                    idx = int(m.get(key))
-                    if idx >= 0 and outcome_names and idx < len(outcome_names):
-                        w = cls._normalize_winner(outcome_names[idx])
-                        if w:
-                            return w
-                except Exception:
-                    pass
+                winner = cls._winner_from_index(m.get(key), outcome_names)
+                if winner:
+                    return winner
 
         if not outcome_names:
-            winner_name = m.get("winnerName") or m.get("winningOutcomeName") or m.get("result_name")
-            w = cls._normalize_winner(winner_name)
-            if w:
-                return w
+            winner_name = (
+                m.get("winnerName")
+                or m.get("winningOutcomeName")
+                or m.get("result_name")
+                or m.get("final_answer")
+                or m.get("finalAnswer")
+            )
+            winner = cls._normalize_winner(winner_name)
+            if winner:
+                return winner
+
+        if not resolved:
+            return None
+
+        if outcome_names and prices and len(outcome_names) == len(prices):
+            try:
+                idx = max(range(len(prices)), key=lambda i: float(prices[i]))
+                winner = cls._normalize_winner(outcome_names[idx])
+                if winner:
+                    return winner
+            except Exception:  # noqa: BLE001
+                pass
+
+        stack: list[tuple[Any, int]] = [(m, 0)]
+        seen: set[int] = set()
+        while stack:
+            node, depth = stack.pop()
+            if depth > 12:
+                continue
+            obj_id = id(node)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+
+            if isinstance(node, dict):
+                for key in winner_keys:
+                    if key in node:
+                        winner = cls._normalize_winner(node.get(key))
+                        if winner:
+                            return winner
+                for value in node.values():
+                    if isinstance(value, (dict, list, tuple)):
+                        stack.append((value, depth + 1))
+            elif isinstance(node, list):
+                for item in node:
+                    if isinstance(item, (dict, list, tuple)):
+                        stack.append((item, depth + 1))
 
         return None
 
@@ -452,8 +525,6 @@ class MarketDiscovery:
 
                 if isinstance(data, dict):
                     data = [data]
-                if isinstance(data, dict):
-                    data = [data]
                 if not isinstance(data, list) or not data:
                     last_err = ValueError("empty or invalid gamma payload")
                     if attempt < retries - 1:
@@ -461,72 +532,43 @@ class MarketDiscovery:
                         continue
                     return None
 
-                if isinstance(data, list):
-                    queue = []
-                    for item in data:
-                        if isinstance(item, dict):
-                            queue.append(item)
-                            if isinstance(item.get("markets"), list):
-                                queue.extend(item["markets"])
-                        elif isinstance(item, list):
-                            queue.extend(item)
-                    data = queue
+                queue = []
+                for item in data:
+                    if isinstance(item, dict):
+                        queue.append(item)
+                        nested = item.get("markets")
+                        if isinstance(nested, list):
+                            queue.extend(nested)
+                        for key in ("payload", "market", "data"):
+                            child = item.get(key)
+                            if isinstance(child, dict):
+                                queue.append(child)
+                            elif isinstance(child, list):
+                                queue.extend([x for x in child if isinstance(x, dict)])
+                    elif isinstance(item, list):
+                        queue.extend([x for x in item if isinstance(x, dict)])
+                data = queue or data
 
                 for m in data:
                     if not isinstance(m, dict):
-                        continue
-
-                    status = str(
-                        m.get("status")
-                        or m.get("marketStatus")
-                        or m.get("market_status")
-                        or m.get("resolutionStatus")
-                        or ""
-                    ).lower()
-                    resolved = status in {
-                        "closed",
-                        "resolved",
-                        "finalized",
-                        "settled",
-                        "finalized_by_oracle",
-                        "resolved_by_oracle",
-                    }
-                    if not resolved:
-                        resolved = any(
-                            bool(m.get(k))
-                            for k in (
-                                "closed",
-                                "resolved",
-                                "finalized",
-                                "isResolved",
-                                "is_resolved",
-                                "isFinalized",
-                                "is_finalized",
-                                "hasResolved",
-                                "has_resolved",
-                            )
-                            if k in m
-                        )
-
-                    if not resolved:
                         continue
 
                     winner = self._extract_winner_from_market(m)
                     if winner:
                         return winner
 
-                    payload = m.get("payload")
-                    if isinstance(payload, dict):
-                        winner = self._extract_winner_from_market(payload)
-                        if winner:
-                            return winner
-
-                    for key in ("market", "data"):
+                    for key in ("payload", "market", "data", "result_payload", "resolvedMarket"):
                         node = m.get(key)
                         if isinstance(node, dict):
                             winner = self._extract_winner_from_market(node)
                             if winner:
                                 return winner
+                        elif isinstance(node, list):
+                            for item in node:
+                                if isinstance(item, dict):
+                                    winner = self._extract_winner_from_market(item)
+                                    if winner:
+                                        return winner
 
                 last_err = ValueError("no final winner in gamma payload")
             except Exception as exc:  # noqa: BLE001
@@ -1088,3 +1130,4 @@ __all__ = [
     "now_ms",
     "try_refresh_book_snapshot",
 ]
+
