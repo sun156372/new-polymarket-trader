@@ -95,9 +95,9 @@ def _normalize_winner(value: Any) -> str | None:
     if isinstance(value, bool):
         return "UP" if value else "DOWN"
     s = str(value).strip().lower()
-    if s in {"up", "yes", "y", "1", "true", "winner_up", "winner-up"}:
+    if s in {"up", "yes", "y", "1", "true", "winner_up", "winner-up", "up_token", "winner-token-up"}:
         return "UP"
-    if s in {"down", "no", "n", "0", "false", "winner_down", "winner-down"}:
+    if s in {"down", "no", "n", "0", "false", "winner_down", "winner-down", "down_token", "winner-token-down"}:
         return "DOWN"
     return None
 
@@ -239,28 +239,32 @@ class MarketDiscovery:
 
     @staticmethod
     def _normalize_winner(value: Any) -> str | None:
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            return "UP" if value else "DOWN"
-        s = str(value).strip().lower()
-        if s in {"up", "yes", "y", "1", "true", "winner_up", "winner-up"}:
-            return "UP"
-        if s in {"down", "no", "n", "0", "false", "winner_down", "winner-down"}:
-            return "DOWN"
-        return None
+        return _normalize_winner(value)
 
     @staticmethod
     def slug_for(now: int) -> tuple[str, int]:
         start_s = (now // 300_000) * 300
         return f"btc-updown-5m-{start_s}", start_s * 1000
 
-    def _extract_winner_from_market(self, m: dict) -> str | None:
+    @staticmethod
+    def _pick_outcome_name(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            s = value.strip()
+            if s:
+                return s
+            return None
+        if isinstance(value, (int, float)):
+            return str(value)
+        return None
+
+    @classmethod
+    def _extract_winner_from_market(cls, m: dict) -> str | None:
         """Extract the winner from different Gamma payload shapes."""
         if not isinstance(m, dict):
             return None
 
-        # 1) Direct winner fields
         for key in (
             "winningOutcome",
             "winner",
@@ -280,27 +284,35 @@ class MarketDiscovery:
             "finalOutcome",
             "final_outcome",
             "resolution",
+            "winningAssetId",
+            "winning_asset_id",
+            "winnerAssetId",
+            "winner_asset_id",
+            "winnerTokenId",
+            "winner_token_id",
+            "winnerAsset",
+            "winningAsset",
         ):
             if key in m:
-                w = self._normalize_winner(m.get(key))
+                w = cls._normalize_winner(m.get(key))
                 if w:
                     return w
 
-        # 2) status string compatibility: status="closed" or marketStatus="resolved"
+        for key in ("market", "payload", "data", "result_payload"):
+            node = m.get(key)
+            if isinstance(node, dict):
+                w = cls._extract_winner_from_market(node)
+                if w:
+                    return w
+
         status = str(
             m.get("status")
             or m.get("marketStatus")
             or m.get("market_status")
+            or m.get("resolutionStatus")
             or ""
         ).lower()
-
-        if status not in {
-            "closed",
-            "resolved",
-            "finalized",
-            "settled",
-            "finalized_by_oracle",
-        }:
+        if status not in {"closed", "resolved", "finalized", "settled", "finalized_by_oracle", "resolved_by_oracle"}:
             resolved_flag = any(
                 bool(m.get(k))
                 for k in (
@@ -311,15 +323,16 @@ class MarketDiscovery:
                     "is_resolved",
                     "isFinalized",
                     "is_finalized",
+                    "hasResolved",
+                    "has_resolved",
                 )
                 if k in m
             )
             if not resolved_flag and not status:
                 return None
 
-        # 3) outcomes + outcomePrices / prices mapping
         outcome_names: list[str] = []
-        outcomes_raw = self._json_list(m.get("outcomes"))
+        outcomes_raw = cls._json_list(m.get("outcomes"))
         if outcomes_raw:
             for raw in outcomes_raw:
                 if isinstance(raw, dict):
@@ -328,38 +341,59 @@ class MarketDiscovery:
                         or raw.get("label")
                         or raw.get("outcome")
                         or raw.get("title")
+                        or raw.get("value")
                     )
-                    if name is not None:
-                        outcome_names.append(str(name))
+                    name_s = cls._pick_outcome_name(name)
+                    if name_s:
+                        outcome_names.append(str(name_s))
                 else:
-                    outcome_names.append(str(raw))
+                    name_s = cls._pick_outcome_name(raw)
+                    if name_s:
+                        outcome_names.append(str(name_s))
 
-        prices = self._coerce_float_list(
-            m.get("outcomePrices") or m.get("prices") or m.get("outcome_prices")
+        prices = cls._coerce_float_list(
+            m.get("outcomePrices")
+            or m.get("prices")
+            or m.get("outcome_prices")
+            or m.get("resolvedPrices")
+            or m.get("resolved_prices")
         )
 
         if outcome_names and prices and len(outcome_names) == len(prices):
             try:
                 idx = max(range(len(prices)), key=lambda i: float(prices[i]))
-                w = self._normalize_winner(outcome_names[idx])
+                w = cls._normalize_winner(outcome_names[idx])
                 if w:
                     return w
             except Exception:
                 pass
 
-        # 4) winningIndex / winnerIndex compatibility
         for key in ("winningIndex", "winnerIndex", "winning_index", "winner_index"):
             if key in m:
                 try:
                     idx = int(m.get(key))
                     if idx >= 0 and outcome_names and idx < len(outcome_names):
-                        w = self._normalize_winner(outcome_names[idx])
+                        w = cls._normalize_winner(outcome_names[idx])
                         if w:
                             return w
                 except Exception:
                     pass
 
+        if not outcome_names:
+            winner_name = m.get("winnerName") or m.get("winningOutcomeName") or m.get("result_name")
+            w = cls._normalize_winner(winner_name)
+            if w:
+                return w
+
         return None
+
+    @staticmethod
+    def _coerce_float_list(v: Any) -> list[float]:
+        return _coerce_float_list(v)
+
+    @staticmethod
+    def _json_list(v: Any) -> list:
+        return MarketDiscovery._json_list(v)
 
     def fetch(self, slug: str, retries: int = 5) -> Market | None:
         url = f"{self.gamma_url}/markets?slug={urllib.parse.quote(slug)}"
@@ -418,6 +452,8 @@ class MarketDiscovery:
 
                 if isinstance(data, dict):
                     data = [data]
+                if isinstance(data, dict):
+                    data = [data]
                 if not isinstance(data, list) or not data:
                     last_err = ValueError("empty or invalid gamma payload")
                     if attempt < retries - 1:
@@ -425,26 +461,36 @@ class MarketDiscovery:
                         continue
                     return None
 
+                if isinstance(data, list):
+                    queue = []
+                    for item in data:
+                        if isinstance(item, dict):
+                            queue.append(item)
+                            if isinstance(item.get("markets"), list):
+                                queue.extend(item["markets"])
+                        elif isinstance(item, list):
+                            queue.extend(item)
+                    data = queue
+
                 for m in data:
                     if not isinstance(m, dict):
                         continue
 
-                    # New logic: resolve via status OR boolean finalization fields
                     status = str(
                         m.get("status")
                         or m.get("marketStatus")
                         or m.get("market_status")
+                        or m.get("resolutionStatus")
                         or ""
                     ).lower()
-
                     resolved = status in {
                         "closed",
                         "resolved",
                         "finalized",
                         "settled",
                         "finalized_by_oracle",
+                        "resolved_by_oracle",
                     }
-
                     if not resolved:
                         resolved = any(
                             bool(m.get(k))
@@ -456,6 +502,8 @@ class MarketDiscovery:
                                 "is_resolved",
                                 "isFinalized",
                                 "is_finalized",
+                                "hasResolved",
+                                "has_resolved",
                             )
                             if k in m
                         )
@@ -466,6 +514,19 @@ class MarketDiscovery:
                     winner = self._extract_winner_from_market(m)
                     if winner:
                         return winner
+
+                    payload = m.get("payload")
+                    if isinstance(payload, dict):
+                        winner = self._extract_winner_from_market(payload)
+                        if winner:
+                            return winner
+
+                    for key in ("market", "data"):
+                        node = m.get(key)
+                        if isinstance(node, dict):
+                            winner = self._extract_winner_from_market(node)
+                            if winner:
+                                return winner
 
                 last_err = ValueError("no final winner in gamma payload")
             except Exception as exc:  # noqa: BLE001
@@ -491,6 +552,8 @@ class PolymarketFeed:
         self._stop = asyncio.Event()
         self._max_backoff = max_backoff
         self._raw_debug_count = 0
+        self.market_resolution_cache: dict[str, str] = {}
+        self.asset_resolution_cache: dict[str, str] = {}
 
     def book(self, token_id: str) -> Book:
         token = _valid_token_id(token_id)
@@ -612,6 +675,119 @@ class PolymarketFeed:
         )
         return book
 
+    @staticmethod
+    def _normalize_event_winner(value: Any) -> str | None:
+        return _normalize_winner(value)
+
+    def _remember_resolution(self, msg: dict) -> None:
+        if not isinstance(msg, dict):
+            return
+
+        winner = None
+        for key in (
+            "winner",
+            "winningOutcome",
+            "winning_outcome",
+            "result",
+            "winningOutcomeName",
+            "winnerName",
+            "finalOutcome",
+            "final_outcome",
+            "outcomeWinner",
+            "winningAssetId",
+            "winning_asset_id",
+            "winnerAssetId",
+            "winner_asset_id",
+            "winning_asset",
+            "winner_asset",
+        ):
+            if key in msg:
+                winner = self._normalize_event_winner(msg.get(key))
+                if winner:
+                    break
+
+        if winner is None:
+            for key in ("payload", "market", "data"):
+                node = msg.get(key)
+                if isinstance(node, dict):
+                    if node.get("winner") is not None:
+                        winner = self._normalize_event_winner(node.get("winner"))
+                    elif node.get("winningOutcome") is not None:
+                        winner = self._normalize_event_winner(node.get("winningOutcome"))
+                    if winner:
+                        break
+
+        if winner is None:
+            market_id = str(
+                msg.get("condition_id")
+                or msg.get("conditionId")
+                or msg.get("market_id")
+                or msg.get("marketId")
+                or msg.get("id")
+                or ""
+            )
+            if not market_id:
+                return
+            if msg.get("marketStatus") is not None or msg.get("status") is not None:
+                if str(msg.get("marketStatus") or msg.get("status") or "").lower() in {"resolved", "closed", "finalized", "settled"}:
+                    winner = self._normalize_event_winner(msg.get("winner")) or self._normalize_event_winner(msg.get("result"))
+
+        if winner is None:
+            return
+
+        condition_id = str(
+            msg.get("condition_id")
+            or msg.get("conditionId")
+            or msg.get("market_id")
+            or msg.get("marketId")
+            or msg.get("id")
+            or ""
+        )
+        if condition_id:
+            self.market_resolution_cache[condition_id] = winner
+
+        winning_asset_id = msg.get("winning_asset_id") or msg.get("winningAssetId") or msg.get("winner_asset_id") or msg.get("winnerAssetId")
+        if winning_asset_id:
+            self.asset_resolution_cache[str(winning_asset_id)] = winner
+
+        for key in ("assets_ids", "asset_ids", "tokens"):
+            ids = msg.get(key)
+            if isinstance(ids, list):
+                for asset in ids:
+                    if asset:
+                        self.asset_resolution_cache[str(asset)] = winner
+
+    def _extract_event_winner(self, msg: dict) -> str | None:
+        winner = None
+        for key in (
+            "winner",
+            "winningOutcome",
+            "winning_outcome",
+            "result",
+            "winningOutcomeName",
+            "winnerName",
+            "finalOutcome",
+            "final_outcome",
+            "outcomeWinner",
+            "winningAssetId",
+            "winning_asset_id",
+            "winnerAssetId",
+            "winner_asset_id",
+            "winning_asset",
+            "winner_asset",
+        ):
+            if key in msg:
+                winner = self._normalize_event_winner(msg.get(key))
+                if winner:
+                    return winner
+        for key in ("payload", "market", "data"):
+            node = msg.get(key)
+            if isinstance(node, dict):
+                w = self._extract_event_winner(node)
+                if w:
+                    return w
+        return None
+
     async def subscribe(self, tokens: Iterable[str]) -> None:
         new = {str(t).strip() for t in tokens if t and _valid_token_id(t)}
         if new == self.tokens:
@@ -689,6 +865,13 @@ class PolymarketFeed:
             if event_type is None:
                 event_type = ""
             et = str(event_type).lower()
+
+            if et in {"market_resolved", "marketresolved", "resolution", "resolved", "finalized", "finalize", "market_finalized"}:
+                winner = self._extract_event_winner(m)
+                if winner:
+                    self._remember_resolution(m)
+                    LOG.info("[WS resolved] event=%s winner=%s", et, winner)
+                continue
 
             token = m.get("asset_id")
             if token is None:
