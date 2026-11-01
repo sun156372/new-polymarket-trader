@@ -9,7 +9,7 @@ Design rules:
     silently starves on missing WebSocket book updates
   * All token IDs are preserved as full strings; no silent truncation
   * winner resolution is resilient: retry + multi-field extraction + no destructive clear
-"""
+ """
 from __future__ import annotations
 
 import asyncio
@@ -94,6 +94,12 @@ def _normalize_winner(value: Any) -> str | None:
         return None
     if isinstance(value, bool):
         return "UP" if value else "DOWN"
+    if isinstance(value, (int, float)):
+        if value == 1:
+            return "UP"
+        if value == 0:
+            return "DOWN"
+        return None
     s = str(value).strip().lower()
     if s in {"up", "yes", "y", "1", "true", "winner_up", "winner-up", "up_token", "winner-token-up"}:
         return "UP"
@@ -117,7 +123,6 @@ def _coerce_float_list(v: Any) -> list[float]:
             items = [items]
     else:
         items = [v]
-
     for x in items:
         try:
             out.append(float(x))
@@ -260,12 +265,35 @@ class MarketDiscovery:
         return None
 
     @classmethod
+    def _iter_nested_values(cls, obj: Any, *, max_depth: int = 12) -> Iterable[Any]:
+        """Safely iterate nested dict/list structures without recursive blow-ups."""
+        stack: list[tuple[Any, int]] = [(obj, 0)]
+        seen: set[int] = set()
+        while stack:
+            node, depth = stack.pop()
+            if depth > max_depth:
+                continue
+            oid = id(node)
+            if oid in seen:
+                continue
+            seen.add(oid)
+            if isinstance(node, dict):
+                yield node
+                for value in node.values():
+                    if isinstance(value, (dict, list, tuple)):
+                        stack.append((value, depth + 1))
+            elif isinstance(node, list):
+                for item in node:
+                    if isinstance(item, (dict, list, tuple)):
+                        stack.append((item, depth + 1))
+
+    @classmethod
     def _extract_winner_from_market(cls, m: dict) -> str | None:
-        """Extract the winner from different Gamma payload shapes."""
+        """Extract the winner from different Gamma payload shapes without recursive blow-ups."""
         if not isinstance(m, dict):
             return None
 
-        for key in (
+        winner_keys = (
             "winningOutcome",
             "winner",
             "winning_outcome",
@@ -292,18 +320,16 @@ class MarketDiscovery:
             "winner_token_id",
             "winnerAsset",
             "winningAsset",
-        ):
-            if key in m:
-                w = cls._normalize_winner(m.get(key))
-                if w:
-                    return w
+        )
 
-        for key in ("market", "payload", "data", "result_payload"):
-            node = m.get(key)
-            if isinstance(node, dict):
-                w = cls._extract_winner_from_market(node)
-                if w:
-                    return w
+        for node in cls._iter_nested_values(m):
+            if not isinstance(node, dict):
+                continue
+            for key in winner_keys:
+                if key in node:
+                    w = _normalize_winner(node.get(key))
+                    if w:
+                        return w
 
         status = str(
             m.get("status")
@@ -312,8 +338,16 @@ class MarketDiscovery:
             or m.get("resolutionStatus")
             or ""
         ).lower()
-        if status not in {"closed", "resolved", "finalized", "settled", "finalized_by_oracle", "resolved_by_oracle"}:
-            resolved_flag = any(
+        resolved = status in {
+            "closed",
+            "resolved",
+            "finalized",
+            "settled",
+            "finalized_by_oracle",
+            "resolved_by_oracle",
+        }
+        if not resolved:
+            resolved = any(
                 bool(m.get(k))
                 for k in (
                     "closed",
@@ -328,30 +362,25 @@ class MarketDiscovery:
                 )
                 if k in m
             )
-            if not resolved_flag and not status:
-                return None
 
         outcome_names: list[str] = []
         outcomes_raw = cls._json_list(m.get("outcomes"))
+        if not outcomes_raw:
+            outcomes_raw = cls._json_list(m.get("outcomeNames"))
         if outcomes_raw:
             for raw in outcomes_raw:
                 if isinstance(raw, dict):
-                    name = (
-                        raw.get("name")
-                        or raw.get("label")
-                        or raw.get("outcome")
-                        or raw.get("title")
-                        or raw.get("value")
-                    )
-                    name_s = cls._pick_outcome_name(name)
-                    if name_s:
-                        outcome_names.append(str(name_s))
+                    for key in ("name", "label", "outcome", "title", "value"):
+                        name_s = cls._pick_outcome_name(raw.get(key))
+                        if name_s:
+                            outcome_names.append(str(name_s))
+                            break
                 else:
                     name_s = cls._pick_outcome_name(raw)
                     if name_s:
                         outcome_names.append(str(name_s))
 
-        prices = cls._coerce_float_list(
+        prices = _coerce_float_list(
             m.get("outcomePrices")
             or m.get("prices")
             or m.get("outcome_prices")
@@ -362,10 +391,10 @@ class MarketDiscovery:
         if outcome_names and prices and len(outcome_names) == len(prices):
             try:
                 idx = max(range(len(prices)), key=lambda i: float(prices[i]))
-                w = cls._normalize_winner(outcome_names[idx])
+                w = _normalize_winner(outcome_names[idx])
                 if w:
                     return w
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
 
         for key in ("winningIndex", "winnerIndex", "winning_index", "winner_index"):
@@ -373,17 +402,26 @@ class MarketDiscovery:
                 try:
                     idx = int(m.get(key))
                     if idx >= 0 and outcome_names and idx < len(outcome_names):
-                        w = cls._normalize_winner(outcome_names[idx])
+                        w = _normalize_winner(outcome_names[idx])
                         if w:
                             return w
-                except Exception:
+                except Exception:  # noqa: BLE001
                     pass
 
         if not outcome_names:
-            winner_name = m.get("winnerName") or m.get("winningOutcomeName") or m.get("result_name")
-            w = cls._normalize_winner(winner_name)
+            winner_name = (
+                m.get("winnerName")
+                or m.get("winningOutcomeName")
+                or m.get("result_name")
+                or m.get("final_answer")
+                or m.get("finalAnswer")
+            )
+            w = _normalize_winner(winner_name)
             if w:
                 return w
+
+        if not resolved:
+            return None
 
         return None
 
@@ -430,12 +468,7 @@ class MarketDiscovery:
         return None
 
     def resolve(self, slug: str, retries: int = 6, backoff_s: float = 1.5) -> str | None:
-        """
-        Robust winner resolution:
-        - retry Gamma queries
-        - support multiple payload shapes
-        - do not assume None means final loser
-        """
+        """Resolve winner in pushed Gamma payloads using safe, bounded traversal."""
         last_err = None
         for attempt in range(retries):
             try:
@@ -452,8 +485,6 @@ class MarketDiscovery:
 
                 if isinstance(data, dict):
                     data = [data]
-                if isinstance(data, dict):
-                    data = [data]
                 if not isinstance(data, list) or not data:
                     last_err = ValueError("empty or invalid gamma payload")
                     if attempt < retries - 1:
@@ -461,21 +492,27 @@ class MarketDiscovery:
                         continue
                     return None
 
-                if isinstance(data, list):
-                    queue = []
-                    for item in data:
-                        if isinstance(item, dict):
-                            queue.append(item)
-                            if isinstance(item.get("markets"), list):
-                                queue.extend(item["markets"])
-                        elif isinstance(item, list):
-                            queue.extend(item)
-                    data = queue
+                candidates: list[dict] = []
+                for item in data:
+                    if isinstance(item, dict):
+                        candidates.append(item)
+                        nested = item.get("markets")
+                        if isinstance(nested, list):
+                            candidates.extend(x for x in nested if isinstance(x, dict))
+                        for key in ("payload", "market", "data"):
+                            child = item.get(key)
+                            if isinstance(child, dict):
+                                candidates.append(child)
+                            elif isinstance(child, list):
+                                candidates.extend(x for x in child if isinstance(x, dict))
+                    elif isinstance(item, list):
+                        candidates.extend(x for x in item if isinstance(x, dict))
+                if not candidates:
+                    candidates = [x for x in data if isinstance(x, dict)]
 
-                for m in data:
+                for m in candidates:
                     if not isinstance(m, dict):
                         continue
-
                     status = str(
                         m.get("status")
                         or m.get("marketStatus")
@@ -507,7 +544,6 @@ class MarketDiscovery:
                             )
                             if k in m
                         )
-
                     if not resolved:
                         continue
 
@@ -515,16 +551,10 @@ class MarketDiscovery:
                     if winner:
                         return winner
 
-                    payload = m.get("payload")
-                    if isinstance(payload, dict):
-                        winner = self._extract_winner_from_market(payload)
-                        if winner:
-                            return winner
-
-                    for key in ("market", "data"):
-                        node = m.get(key)
-                        if isinstance(node, dict):
-                            winner = self._extract_winner_from_market(node)
+                    for key in ("payload", "market", "data"):
+                        child = m.get(key)
+                        if isinstance(child, dict):
+                            winner = self._extract_winner_from_market(child)
                             if winner:
                                 return winner
 
@@ -532,7 +562,6 @@ class MarketDiscovery:
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
                 LOG.warning("resolve %s attempt=%d failed: %s", slug, attempt + 1, exc)
-
             if attempt < retries - 1:
                 time.sleep(backoff_s * (attempt + 1))
 
@@ -587,7 +616,6 @@ class PolymarketFeed:
                     stale = True
                 elif now - book.last_update_ms > 1000:
                     stale = True
-
             if stale:
                 print(
                     f"[REST Fallback] stale/empty book for token={token} age_ms={now - book.last_update_ms if book.last_update_ms else 'n/a'}",
@@ -596,7 +624,6 @@ class PolymarketFeed:
                 refreshed = self.refresh_book_snapshot(token, timeout=timeout)
                 if refreshed is not None:
                     return refreshed
-
         return book
 
     def refresh_book_snapshot(self, token_id: str, timeout: float = 10.0) -> Book | None:
@@ -626,7 +653,6 @@ class PolymarketFeed:
                 data = data["book"]
             elif "data" in data and isinstance(data["data"], dict):
                 data = data["data"]
-
         if not isinstance(data, dict):
             print(f"[REST Fallback] Unexpected response shape for token={token}: {type(data).__name__}", flush=True)
             return None
@@ -636,7 +662,6 @@ class PolymarketFeed:
             bids = data.get("buys")
         if bids is None:
             bids = data.get("bid")
-
         if bids is None and "book" in data and isinstance(data["book"], dict):
             book_obj = data["book"]
             bids = book_obj.get("bids")
@@ -644,7 +669,6 @@ class PolymarketFeed:
                 bids = book_obj.get("buys")
             if bids is None:
                 bids = book_obj.get("bid")
-
         if bids is None:
             bids = []
 
@@ -653,7 +677,6 @@ class PolymarketFeed:
             asks = data.get("sells")
         if asks is None:
             asks = data.get("ask")
-
         if asks is None and "book" in data and isinstance(data["book"], dict):
             book_obj = data["book"]
             asks = book_obj.get("asks")
@@ -661,7 +684,6 @@ class PolymarketFeed:
                 asks = book_obj.get("sells")
             if asks is None:
                 asks = book_obj.get("ask")
-
         if asks is None:
             asks = []
 
@@ -682,7 +704,6 @@ class PolymarketFeed:
     def _remember_resolution(self, msg: dict) -> None:
         if not isinstance(msg, dict):
             return
-
         winner = None
         for key in (
             "winner",
@@ -705,7 +726,6 @@ class PolymarketFeed:
                 winner = self._normalize_event_winner(msg.get(key))
                 if winner:
                     break
-
         if winner is None:
             for key in ("payload", "market", "data"):
                 node = msg.get(key)
@@ -716,7 +736,6 @@ class PolymarketFeed:
                         winner = self._normalize_event_winner(node.get("winningOutcome"))
                     if winner:
                         break
-
         if winner is None:
             market_id = str(
                 msg.get("condition_id")
@@ -731,7 +750,6 @@ class PolymarketFeed:
             if msg.get("marketStatus") is not None or msg.get("status") is not None:
                 if str(msg.get("marketStatus") or msg.get("status") or "").lower() in {"resolved", "closed", "finalized", "settled"}:
                     winner = self._normalize_event_winner(msg.get("winner")) or self._normalize_event_winner(msg.get("result"))
-
         if winner is None:
             return
 
@@ -758,8 +776,9 @@ class PolymarketFeed:
                         self.asset_resolution_cache[str(asset)] = winner
 
     def _extract_event_winner(self, msg: dict) -> str | None:
-        winner = None
-        for key in (
+        if not isinstance(msg, dict):
+            return None
+        winner_keys = (
             "winner",
             "winningOutcome",
             "winning_outcome",
@@ -775,17 +794,15 @@ class PolymarketFeed:
             "winner_asset_id",
             "winning_asset",
             "winner_asset",
-        ):
-            if key in msg:
-                winner = self._normalize_event_winner(msg.get(key))
-                if winner:
-                    return winner
-        for key in ("payload", "market", "data"):
-            node = msg.get(key)
-            if isinstance(node, dict):
-                w = self._extract_event_winner(node)
-                if w:
-                    return w
+        )
+        for node in MarketDiscovery._iter_nested_values(msg):
+            if not isinstance(node, dict):
+                continue
+            for key in winner_keys:
+                if key in node:
+                    w = _normalize_winner(node.get(key))
+                    if w:
+                        return w
         return None
 
     async def subscribe(self, tokens: Iterable[str]) -> None:
@@ -856,7 +873,6 @@ class PolymarketFeed:
         for m in (msg if isinstance(msg, list) else [msg]):
             if not isinstance(m, dict):
                 continue
-
             event_type = m.get("event_type")
             if event_type is None:
                 event_type = m.get("type")
@@ -882,17 +898,10 @@ class PolymarketFeed:
                 token = m.get("assetId")
             if token is None:
                 token = ""
-
             if not token:
                 payload = m.get("payload")
                 if isinstance(payload, dict):
-                    token = payload.get("asset_id")
-                    if token is None:
-                        token = payload.get("token_id")
-                    if token is None:
-                        token = payload.get("tokenId")
-                    if token is None:
-                        token = ""
+                    token = payload.get("asset_id") or payload.get("token_id") or payload.get("tokenId") or ""
             token = _valid_token_id(token)
             if not token:
                 continue
@@ -906,48 +915,30 @@ class PolymarketFeed:
                     bids = m.get("buys")
                 if bids is None:
                     bids = m.get("bid")
-
                 asks = m.get("asks")
                 if asks is None:
                     asks = m.get("sells")
                 if asks is None:
                     asks = m.get("ask")
-
                 if bids is not None or asks is not None:
                     b.set_book(bids if bids is not None else [], asks if asks is not None else [], ts)
                     b.last_update_ms = int(time.time() * 1000)
-
             elif et == "price_change":
                 changes = m.get("changes")
                 if changes is None:
                     changes = m.get("price_changes")
                 if changes is None:
                     changes = []
-
                 if not changes and m.get("price") is not None:
-                    changes = [{
-                        "price": m.get("price"),
-                        "size": m.get("size"),
-                        "side": m.get("side"),
-                    }]
-
+                    changes = [{"price": m.get("price"), "size": m.get("size"), "side": m.get("side")}]
                 for c in changes:
                     try:
-                        b.apply_change(
-                            float(c["price"]),
-                            float(c.get("size", 0)),
-                            str(c.get("side", "BUY")),
-                            ts,
-                        )
+                        b.apply_change(float(c["price"]), float(c.get("size", 0)), str(c.get("side", "BUY")), ts)
                         b.last_update_ms = int(time.time() * 1000)
                     except (KeyError, TypeError, ValueError):
                         continue
-
             elif et in ("best_bid_ask", "tick_size_change"):
                 b.last_update_ms = int(time.time() * 1000)
-
-    def _handle_price_change(self, raw: str | bytes) -> None:
-        pass
 
 
 class BinanceFeed:
@@ -1002,20 +993,16 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
     """Direct synchronous REST refresh for a single token book."""
     if book.ready:
         return True
-
     token_id = _valid_token_id(book.token_id)
     if not token_id:
         return False
-
     print(f"[REST Fallback] Fetching book for token: {token_id}", flush=True)
-
     url = f"https://clob.polymarket.com/book?token_id={urllib.parse.quote(token_id)}"
     headers = {
         "User-Agent": "v7-sniper/1.0",
         "Accept": "application/json",
         "Referer": "https://polymarket.com/",
     }
-
     try:
         resp = requests.get(url, timeout=timeout, headers=headers)
         resp.raise_for_status()
@@ -1030,7 +1017,6 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
             data = data["book"]
         elif "data" in data and isinstance(data["data"], dict):
             data = data["data"]
-
     if not isinstance(data, dict):
         print(f"[REST Fallback] Unexpected response shape for token={token_id}: {type(data).__name__}", flush=True)
         return False
@@ -1040,7 +1026,6 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
         bids = data.get("buys")
     if bids is None:
         bids = data.get("bid")
-
     if bids is None and "book" in data and isinstance(data["book"], dict):
         book_obj = data["book"]
         bids = book_obj.get("bids")
@@ -1048,7 +1033,6 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
             bids = book_obj.get("buys")
         if bids is None:
             bids = book_obj.get("bid")
-
     if bids is None:
         bids = []
 
@@ -1057,7 +1041,6 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
         asks = data.get("sells")
     if asks is None:
         asks = data.get("ask")
-
     if asks is None and "book" in data and isinstance(data["book"], dict):
         book_obj = data["book"]
         asks = book_obj.get("asks")
@@ -1065,13 +1048,11 @@ def try_refresh_book_snapshot(book: Book, market: Market | None = None, timeout:
             asks = book_obj.get("sells")
         if asks is None:
             asks = book_obj.get("ask")
-
     if asks is None:
         asks = []
 
     book.set_book(bids, asks, now_ms())
     book.last_update_ms = int(time.time() * 1000)
-
     print(
         f"[REST] Refreshed token={token_id} bids={len(bids)} asks={len(asks)}",
         flush=True,
@@ -1088,3 +1069,4 @@ __all__ = [
     "now_ms",
     "try_refresh_book_snapshot",
 ]
+
