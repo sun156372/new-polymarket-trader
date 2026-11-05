@@ -28,8 +28,8 @@ strategy:
   max_quote_staleness_s: 2.0
   max_slippage_cents: 2.0
 
-  # Print one detailed final-window block per market.
-  debug: true
+  # Detailed strategy diagnostics are disabled to keep terminal output concise.
+  debug: false
 
   # DANGEROUS TEST SWITCH:
   # True = bypass ALL thresholds inside the final window and buy the best available side.
