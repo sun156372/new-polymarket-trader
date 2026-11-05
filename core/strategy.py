@@ -155,11 +155,6 @@ def _bps(spot_move: float) -> float:
     return spot_move * 1e4
 
 
-def _gate(reason: str) -> None:
-    """Terminal-visible gate result; independent of logging config."""
-    print(f"[Gate拦截] 原因={reason}", flush=True)
-
-
 def _reject_bad_signal(market: Market, ask: float | None, reason: str) -> None:
     """Common guard: no bad ask can leave this function."""
     if ask is None or not math.isfinite(float(ask)) or float(ask) <= 0:
@@ -173,6 +168,22 @@ def _reject_bad_signal(market: Market, ask: float | None, reason: str) -> None:
 class V6Strategy:
     def __init__(self, params: V6Params):
         self.p = params
+        self._last_gate_log_ms: int | None = None
+
+    def _gate(self, reason: str, now_ms: int) -> None:
+        """Throttle gate diagnostics to at most one line per five seconds.
+
+        A changed gate reason is deliberately not printed immediately: the
+        reason contains live numbers, so it changes on almost every tick and
+        would defeat the throttle.
+        """
+        if (
+            self._last_gate_log_ms is not None
+            and now_ms - self._last_gate_log_ms < 5_000
+        ):
+            return
+        self._last_gate_log_ms = now_ms
+        print(f"[Gate拦截] 原因={reason}", flush=True)
 
     def book_imbalance(
         self,
@@ -247,12 +258,12 @@ class V6Strategy:
         # Hard readiness gate: never compute indicators or emit a Signal
         # from a missing/not-ready order book, including force_trade_test.
         if up_book is None or down_book is None:
-            _gate("book missing")
+            self._gate("book missing", now_ms)
             return None
         if not bool(getattr(up_book, "ready", False)) or not bool(
             getattr(down_book, "ready", False)
         ):
-            _gate("up_ready/down_ready false")
+            self._gate("up_ready/down_ready false", now_ms)
             return None
 
         # 强制测试模式：优先，且直接绕过 quote stale
@@ -310,6 +321,8 @@ class V6Strategy:
         if up_mid is None or down_mid is None:
             return None
 
+        # `move` is the Up-token mid probability change, in the same units as
+        # strategy.move_threshold (0.20 means 20 cents on a 0..1 token).
         move = _number(up_mid - up_mid_open_f)
         if move is None:
             return None
@@ -320,9 +333,17 @@ class V6Strategy:
 
         spot_open_f = _number(spot_open)
         spot_now_f = _number(spot_now)
+        # `spot_move` is a separate fractional BTC return used by the spot
+        # gate. Never substitute raw BTC price for the token-probability move:
+        # 79662.005 - 79662.005 is not comparable to move_threshold=0.20.
         spot_move = (
             None
-            if spot_open_f is None or spot_now_f is None or spot_open_f == 0
+            if (
+                spot_open_f is None
+                or spot_now_f is None
+                or spot_open_f <= 0
+                or spot_now_f <= 0
+            )
             else float((spot_now_f - spot_open_f) / spot_open_f)
         )
         imbalance = float(
@@ -339,7 +360,7 @@ class V6Strategy:
         for label, book in (("up", up_book), ("down", down_book)):
             ts = int(getattr(book, "last_update_ms", 0) or 0)
             if ts <= 0 or now_ms - ts > self.p.max_quote_staleness_s * 1000:
-                _gate(f"{label} quote stale {now_ms - ts}ms")
+                self._gate(f"{label} quote stale {now_ms - ts}ms", now_ms)
                 return None
 
         ask_up = _valid_ask(up_book.best_ask)
@@ -357,11 +378,16 @@ class V6Strategy:
             ask = ask_down
             bid = _number(down_book.best_bid)
         else:
+            spot_now_txt = f"{spot_now_f:.3f}" if spot_now_f is not None else "NA"
+            spot_open_txt = f"{spot_open_f:.3f}" if spot_open_f is not None else "NA"
+            spot_bps_txt = f"{_bps(spot_move):.2f}" if spot_move is not None else "NA"
             reason = (
-                f"gate move={move:.4f} imb={imbalance:.4f} "
-                f"spot={spot_move if spot_move is not None else 'NA'}"
+                f"gate move={move:.4f} (threshold {self.p.move_threshold:.4f}) "
+                f"imb={imbalance:.4f} (min {self.p.min_book_imbalance:.4f}) "
+                f"spot_now={spot_now_txt} spot_open={spot_open_txt} "
+                f"spot_move_bps={spot_bps_txt}"
             )
-            _gate(reason)
+            self._gate(reason, now_ms)
             return None
 
         ask = _valid_ask(ask)
@@ -370,17 +396,20 @@ class V6Strategy:
                 f"[Error] 拦截坏单: market={market.slug} invalid ask after validation ask={ask!r}",
                 flush=True,
             )
-            _gate("no valid ask")
+            self._gate("no valid ask", now_ms)
             return None
 
         if ask > self.p.max_entry_price:
-            _gate(f"max entry ask {ask:.4f} > {self.p.max_entry_price:.4f}")
+            self._gate(f"max entry ask {ask:.4f} > {self.p.max_entry_price:.4f}", now_ms)
             return None
         if spot_move is None:
-            _gate("spot_open/spot_now unavailable")
+            self._gate("spot_open/spot_now unavailable", now_ms)
             return None
         if abs(spot_move) < self.p.min_spot_move:
-            _gate(f"spot move too small {abs(spot_move):.6f} < {self.p.min_spot_move:.6f}")
+            self._gate(
+                f"spot move too small {abs(spot_move):.6f} < {self.p.min_spot_move:.6f}",
+                now_ms,
+            )
             return None
 
         spread = (ask - bid) if bid is not None else 0.0
