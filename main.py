@@ -44,6 +44,12 @@ def _finite_float(value: Any) -> float | None:
     return out if math.isfinite(out) else None
 
 
+def _positive_float(value: Any) -> float | None:
+    """Reject None/0/negative/inf feed prices such as a placeholder spot=0."""
+    out = _finite_float(value)
+    return out if out is not None and out > 0 else None
+
+
 def setup_logging(cfg: dict) -> None:
     log_path = Path(cfg.get("analytics", {}).get("log_path", "logs/v7.log"))
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,6 +135,9 @@ class Runtime:
         self.paper_settle_started_ms: int | None = None
         self.paper_settle_deadline_ms: int | None = None
         self.printed_markets: set[str] = set()
+        self._last_strategy_log_ms: int = 0
+        self._last_strategy_skip_log_ms: int = 0
+        self._last_strategy_none_log_ms: int = 0
         self.stop = asyncio.Event()
         self._startup_health_panel_printed = False
 
@@ -260,6 +269,9 @@ class Runtime:
         self.trade_id = None
         self.paper_settle_started_ms = None
         self.paper_settle_deadline_ms = None
+        self._last_strategy_log_ms = 0
+        self._last_strategy_skip_log_ms = 0
+        self._last_strategy_none_log_ms = 0
 
         await self.pm.bootstrap_snapshot(m)
         await self.pm.subscribe([m.up_token, m.down_token])
@@ -270,10 +282,10 @@ class Runtime:
         if up is not None and up.mid is not None:
             self.up_mid_open = float(up.mid)
 
-        spot = self.binance.spot()
+        spot = _positive_float(self.binance.spot())
         if spot is not None:
-            self.spot_open = float(spot)
-            self.spot_now = float(spot)
+            self.spot_open = spot
+            self.spot_now = spot
 
         self.up_ready = bool(up and up.ready)
         self.down_ready = bool(down and down.ready)
@@ -335,10 +347,10 @@ class Runtime:
                 self.up_mid_open = float(up.mid)
 
         if self.spot_open is None:
-            p = self.binance.spot()
+            p = _positive_float(self.binance.spot())
             if p is not None:
-                self.spot_open = float(p)
-                self.spot_now = float(p)
+                self.spot_open = p
+                self.spot_now = p
 
         if self.up_mid_open is not None and self.spot_open is not None:
             self.market_open_locked = True
@@ -364,9 +376,10 @@ class Runtime:
         else:
             self.move_distance = None
 
-        spot_now = _finite_float(self.spot_now)
-        if spot_now is not None and self.spot_open:
-            self.spot_move = float((spot_now - self.spot_open) / self.spot_open)
+        spot_now = _positive_float(self.spot_now)
+        spot_open = _positive_float(self.spot_open)
+        if spot_now is not None and spot_open is not None:
+            self.spot_move = float((spot_now - spot_open) / spot_open)
         else:
             self.spot_move = None
 
@@ -400,7 +413,7 @@ class Runtime:
                 now - self.market.end_ms,
             )
             return
-        spot = _finite_float(self.binance.spot())
+        spot = _positive_float(self.binance.spot())
         if spot is None:
             return
         self.spot_close = spot
@@ -414,12 +427,12 @@ class Runtime:
 
     def _local_winner_for_position(self, p: Position) -> tuple[str | None, str]:
         """Last-resort UP/DOWN decision from frozen spot open/close."""
-        spot_open = _finite_float(p.spot_open)
-        spot_close = _finite_float(p.spot_close)
+        spot_open = _positive_float(p.spot_open)
+        spot_close = _positive_float(p.spot_close)
         if spot_close is None and self.market is not None and p.market_slug == self.market.slug:
-            spot_close = _finite_float(self.spot_close)
+            spot_close = _positive_float(self.spot_close)
         if spot_open is None and self.market is not None and p.market_slug == self.market.slug:
-            spot_open = _finite_float(self.spot_open)
+            spot_open = _positive_float(self.spot_open)
 
         if spot_open is None or spot_close is None:
             LOG.warning(
@@ -858,24 +871,28 @@ class Runtime:
             self.up_best_ask = up.best_ask if up else None
             self._update_indicators(now)
 
-            LOG.info(
-                "[Main] strategy-check market=%s secs=%.2f up_mid=%s spot_now=%s up_ready=%s down_ready=%s up_best_bid=%s up_best_ask=%s",
-                self.market.slug,
-                secs,
-                up.mid if up else None,
-                self.spot_now,
-                self.up_ready,
-                self.down_ready,
-                self.up_best_bid,
-                self.up_best_ask,
-            )
-
-            if not self.up_ready or not self.down_ready:
+            if now - self._last_strategy_log_ms >= 5_000:
                 LOG.info(
-                    "[Main] strategy skipped: up_ready=%s down_ready=%s",
+                    "[Main] strategy-check market=%s secs=%.2f up_mid=%s spot_now=%s up_ready=%s down_ready=%s up_best_bid=%s up_best_ask=%s",
+                    self.market.slug,
+                    secs,
+                    up.mid if up else None,
+                    self.spot_now,
                     self.up_ready,
                     self.down_ready,
+                    self.up_best_bid,
+                    self.up_best_ask,
                 )
+                self._last_strategy_log_ms = now
+
+            if not self.up_ready or not self.down_ready:
+                if now - self._last_strategy_skip_log_ms >= 5_000:
+                    LOG.info(
+                        "[Main] strategy skipped: up_ready=%s down_ready=%s",
+                        self.up_ready,
+                        self.down_ready,
+                    )
+                    self._last_strategy_skip_log_ms = now
             else:
                 sig = self.strategy.evaluate(
                     market=self.market,
@@ -891,14 +908,15 @@ class Runtime:
                 if sig:
                     self.entry_done = True
                     await self._enter(sig)
-                else:
+                elif now - self._last_strategy_none_log_ms >= 5_000:
                     LOG.info(
-                        "[Main] strategy returned None market=%s secs=%.2f up_mid=%s spot=%s",
+                        "[Main] strategy returned None market=%s secs=%.2f up_mid=%s spot_now=%s",
                         self.market.slug,
                         secs,
                         up.mid if up else None,
                         self.spot_now,
                     )
+                    self._last_strategy_none_log_ms = now
 
         self.analytics.maybe_print()
 
