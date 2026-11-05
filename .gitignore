@@ -1,0 +1,37 @@
+# secrets
+.env
+.env.*
+!.env.example
+live_trading_confirm.txt
+
+# runtime data and logs
+data/
+logs/
+state/
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# bundled/downloaded dependencies and local artifacts
+runtime/
+.deps/
+.vendor/
+.tmp/
+dist/
+build/
+*.zip
+*.diff
+config.smoke.yaml
+
+# os
+.DS_Store
+Thumbs.db
