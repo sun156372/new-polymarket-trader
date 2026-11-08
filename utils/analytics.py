@@ -48,11 +48,13 @@ class Analytics:
 
     trades: int = 0          # settled trades (WIN/LOSS)
     opened: int = 0          # total entries, including still-open positions
-    wins: int = 0            # all settled wins, including local fallback
-    losses: int = 0          # all settled losses
+    wins: int = 0            # official settled wins (local fallback excluded)
+    losses: int = 0          # official settled losses
     official_trades: int = 0 # settled only from Polymarket official result
     official_wins: int = 0
     official_losses: int = 0
+    local_settled: int = 0   # emergency fallback, shown separately
+    local_pnl: float = 0.0
     total_staked: float = 0.0
     total_pnl: float = 0.0
     peak_equity: float = 0.0
@@ -153,6 +155,8 @@ class Analytics:
             self.official_trades = 0
             self.official_wins = 0
             self.official_losses = 0
+            self.local_settled = 0
+            self.local_pnl = 0.0
             self.total_staked = 0.0
             self.total_pnl = 0.0
             self.peak_equity = base
@@ -166,15 +170,18 @@ class Analytics:
 
             for rec in closed:
                 won = rec["status"] == "WIN"
-                self.trades += 1
                 if rec["official"]:
+                    self.trades += 1
                     self.wins += int(won)
                     self.losses += int(not won)
                     self.official_trades += 1
                     self.official_wins += int(won)
                     self.official_losses += int(not won)
-                self.total_staked += rec["cost"]
-                self.total_pnl += rec["pnl"]
+                    self.total_staked += rec["cost"]
+                    self.total_pnl += rec["pnl"]
+                else:
+                    self.local_settled += 1
+                    self.local_pnl += rec["pnl"]
                 self.balance += rec["pnl"]
                 self.peak_equity = max(self.peak_equity, self.balance)
                 self.max_drawdown = min(
@@ -182,7 +189,8 @@ class Analytics:
                 )
                 day = time.strftime("%Y-%m-%d", time.gmtime(rec["settled_ms"] / 1000.0))
                 if day == today:
-                    self.daily_pnl += rec["pnl"]
+                    if rec["official"]:
+                        self.daily_pnl += rec["pnl"]
                     self.daily_trades += 1
                 self.history.append({
                     "ts": rec["settled_ms"] / 1000.0,
@@ -271,20 +279,23 @@ class Analytics:
             raise ValueError(f"invalid settlement: pnl={pnl!r} payout={payout!r}")
         with self._lock:
             self._roll_day()
-            self.trades += 1
             self.daily_trades += 1
             if official:
+                self.trades += 1
                 self.wins += int(won)
                 self.losses += int(not won)
                 self.official_trades += 1
                 self.official_wins += int(won)
                 self.official_losses += int(not won)
-            self.total_staked += float(stake)
-            self.total_pnl += pnl_f
+                self.total_staked += float(stake)
+                self.total_pnl += pnl_f
+                self.daily_pnl += pnl_f
+            else:
+                self.local_settled += 1
+                self.local_pnl += pnl_f
             # Cash balance changes by the returned payout, not by PnL: the
             # entry cost was already removed by debit_entry().
             self.balance += payout_f
-            self.daily_pnl += pnl_f
             self.peak_equity = max(self.peak_equity, self.balance)
             self.max_drawdown = min(self.max_drawdown, self.balance - self.peak_equity)
             self.last_equity = self.balance
@@ -299,13 +310,18 @@ class Analytics:
 
     # --------------------------------------------------------------- output
     def _format(self) -> str:
+        local = (
+            f" local={self.local_pnl:+.4f} ({self.local_settled} fallback)"
+            if self.local_settled
+            else ""
+        )
         return (
             f"{self.tag} balance={self.balance:.4f} pnl={self.total_pnl:+.4f} "
             f"daily={self.daily_pnl:+.4f} "
             f"trades={self.opened}/{self.trades} "
             f"win={self.win_rate * 100:.2f}% "
             f"({self.official_wins}/{self.official_trades} official) "
-            f"mdd={self.max_drawdown:.4f}"
+            f"mdd={self.max_drawdown:.4f}{local}"
         )
 
     def _emit_locked(self, *, force: bool) -> bool:
@@ -357,7 +373,8 @@ class Analytics:
             "official_trades": self.official_trades,
             "official_wins": self.official_wins,
             "official_losses": self.official_losses,
-            "local_trades": self.trades - self.official_trades,
+            "local_trades": self.local_settled,
+            "local_pnl": round(self.local_pnl, 6),
             "win_rate": round(self.win_rate, 6),
             "total_staked": round(self.total_staked, 6),
             "total_pnl": round(self.total_pnl, 6),
