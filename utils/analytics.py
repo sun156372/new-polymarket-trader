@@ -27,6 +27,18 @@ LOG = logging.getLogger("v7.analytics")
 HEARTBEAT_SECONDS = 60.0
 
 
+def _is_official_source(source: object) -> bool:
+    """True only for a winner obtained from Polymarket.
+
+    Local spot close is a deliberate emergency fallback and must never be
+    counted in the headline win rate.
+    """
+    value = str(source or "").strip().lower()
+    if not value:
+        return False
+    return not value.startswith("local")
+
+
 @dataclass
 class Analytics:
     starting_balance: float
@@ -34,9 +46,13 @@ class Analytics:
     mode: str = "paper"
     heartbeat_s: float = HEARTBEAT_SECONDS
 
-    trades: int = 0
-    wins: int = 0
-    losses: int = 0
+    trades: int = 0          # settled trades (WIN/LOSS)
+    opened: int = 0          # total entries, including still-open positions
+    wins: int = 0            # all settled wins, including local fallback
+    losses: int = 0          # all settled losses
+    official_trades: int = 0 # settled only from Polymarket official result
+    official_wins: int = 0
+    official_losses: int = 0
     total_staked: float = 0.0
     total_pnl: float = 0.0
     peak_equity: float = 0.0
@@ -89,10 +105,14 @@ class Analytics:
             raise ValueError(f"invalid starting balance: {starting_balance!r}")
 
         closed: list[dict] = []
+        opened = 0
         for row in rows:
             if not isinstance(row, dict):
                 continue
             status = str(row.get("status", "")).upper()
+            if status not in {"OPEN", "WIN", "LOSS"}:
+                continue
+            opened += 1
             if status not in {"WIN", "LOSS"}:
                 continue
             try:
@@ -108,6 +128,7 @@ class Analytics:
                 continue
             if not (math.isfinite(pnl) and math.isfinite(payout) and math.isfinite(cost)):
                 continue
+            source = str(row.get("resolution_source") or row.get("source") or "")
             closed.append({
                 "status": status,
                 "market": str(row.get("market_id") or row.get("market") or "?"),
@@ -116,6 +137,8 @@ class Analytics:
                 "payout": payout,
                 "cost": max(0.0, cost),
                 "settled_ms": settled_ms,
+                "source": source,
+                "official": _is_official_source(source),
             })
         closed.sort(key=lambda r: r["settled_ms"])
 
@@ -124,8 +147,12 @@ class Analytics:
             self.starting_balance = base
             self.balance = base
             self.trades = 0
+            self.opened = opened
             self.wins = 0
             self.losses = 0
+            self.official_trades = 0
+            self.official_wins = 0
+            self.official_losses = 0
             self.total_staked = 0.0
             self.total_pnl = 0.0
             self.peak_equity = base
@@ -140,8 +167,12 @@ class Analytics:
             for rec in closed:
                 won = rec["status"] == "WIN"
                 self.trades += 1
-                self.wins += int(won)
-                self.losses += int(not won)
+                if rec["official"]:
+                    self.wins += int(won)
+                    self.losses += int(not won)
+                    self.official_trades += 1
+                    self.official_wins += int(won)
+                    self.official_losses += int(not won)
                 self.total_staked += rec["cost"]
                 self.total_pnl += rec["pnl"]
                 self.balance += rec["pnl"]
@@ -185,7 +216,13 @@ class Analytics:
 
     @property
     def win_rate(self) -> float:
-        return self.wins / self.trades if self.trades else 0.0
+        return self.official_wins / self.official_trades if self.official_trades else 0.0
+
+    def note_entry(self) -> None:
+        """Count one new entry for the total-open side of the panel."""
+        with self._lock:
+            self.opened += 1
+            self._dirty = True
 
     def note_position_change(self) -> None:
         """Mark state dirty; next maybe_print() emits one line."""
@@ -218,23 +255,30 @@ class Analytics:
         market: str,
         side: str,
         payout: float | None = None,
+        source: str | None = None,
     ) -> None:
-        """Record a settled trade.
+        """Record one settled trade.
 
-        payout is the cash returned by settlement.  Pass it when entry cost
-        was already debited via debit_entry(); the default (payout=None) keeps
-        the old pnl-only behavior for callers that did not debit entry.
+        ``source`` is the resolution source stored in state history.  Only
+        Polymarket official results contribute to ``win_rate``; local spot
+        fallback is still booked in cash/PnL but excluded from the headline
+        official win rate.
         """
         pnl_f = float(pnl)
         payout_f = pnl_f if payout is None else float(payout)
+        official = _is_official_source(source)
         if not math.isfinite(pnl_f) or not math.isfinite(payout_f):
             raise ValueError(f"invalid settlement: pnl={pnl!r} payout={payout!r}")
         with self._lock:
             self._roll_day()
             self.trades += 1
             self.daily_trades += 1
-            self.wins += int(won)
-            self.losses += int(not won)
+            if official:
+                self.wins += int(won)
+                self.losses += int(not won)
+                self.official_trades += 1
+                self.official_wins += int(won)
+                self.official_losses += int(not won)
             self.total_staked += float(stake)
             self.total_pnl += pnl_f
             # Cash balance changes by the returned payout, not by PnL: the
@@ -249,6 +293,7 @@ class Analytics:
                 "ts": time.time(), "market": market, "side": side,
                 "stake": stake, "pnl": pnl_f, "payout": payout_f,
                 "won": won, "balance": self.balance,
+                "source": str(source or ""),
             })
             self._emit_locked(force=True)
 
@@ -256,8 +301,10 @@ class Analytics:
     def _format(self) -> str:
         return (
             f"{self.tag} balance={self.balance:.4f} pnl={self.total_pnl:+.4f} "
-            f"daily={self.daily_pnl:+.4f} trades={self.trades}/{self.daily_trades} "
-            f"win={self.win_rate * 100:.2f}% ({self.wins}/{self.trades}) "
+            f"daily={self.daily_pnl:+.4f} "
+            f"trades={self.opened}/{self.trades} "
+            f"win={self.win_rate * 100:.2f}% "
+            f"({self.official_wins}/{self.official_trades} official) "
             f"mdd={self.max_drawdown:.4f}"
         )
 
@@ -303,8 +350,14 @@ class Analytics:
             "balance": round(self.balance, 6),
             "starting_balance": self.starting_balance,
             "trades": self.trades,
+            "opened": self.opened,
+            "settled": self.trades,
             "wins": self.wins,
             "losses": self.losses,
+            "official_trades": self.official_trades,
+            "official_wins": self.official_wins,
+            "official_losses": self.official_losses,
+            "local_trades": self.trades - self.official_trades,
             "win_rate": round(self.win_rate, 6),
             "total_staked": round(self.total_staked, 6),
             "total_pnl": round(self.total_pnl, 6),
