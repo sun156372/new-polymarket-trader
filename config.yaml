@@ -46,13 +46,14 @@ exit:
 
 resolution:
   # Grace period after close before the first Gamma poll (network/clock jitter).
-  start_buffer_s: 5
+  start_buffer_s: 15
   # Bounded polling; never spin the Gamma API once per 250ms main-loop tick.
   poll_interval_s: 5
-  # If Gamma is still unresolved after this, settle locally from frozen spot.
-  fallback_after_s: 120
+  # Official-first: keep PENDING_RESOLUTION and poll Gamma for this long.
+  # Only after 5 minutes without an official winner may spot be used.
+  fallback_after_s: 300
   # Give up and mark unresolved for manual review after this.
-  hard_deadline_s: 300
+  hard_deadline_s: 900
 
 costs:
   fee_model: "0.07 * p * (1-p)"
