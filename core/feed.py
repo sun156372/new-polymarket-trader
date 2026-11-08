@@ -1051,20 +1051,10 @@ class MarketDiscovery:
             )
             labels = [str(x).strip() for x in outcomes]
 
-            # Do not honour a winner field before the market is actually
-            # final.  A transient/early API value must not settle a live trade.
-            status = str(
-                market.get("umaResolutionStatus")
-                or market.get("resolutionStatus")
-                or ""
-            ).strip().lower()
-            closed = (
-                _as_bool(market.get("closed"))
-                or _as_bool(market.get("resolved"))
-                or _as_bool(market.get("isResolved"))
-                or status in {"resolved", "finalized"}
-            )
-            if not closed:
+            # Require the canonical ``closed`` flag.  ``resolved`` alone can
+            # appear while the book is still settling; using it here would
+            # reintroduce early/incorrect cash settlement.
+            if not _as_bool(market.get("closed")):
                 return None
 
             # Explicit winner fields are accepted first, but index fields are
