@@ -28,6 +28,7 @@ from core.feed import BinanceFeed, Market, MarketDiscovery, PolymarketFeed, now_
 from core.redeem_engine import RedeemEngine
 from core.state_manager import Position, StateManager, new_trade_id
 from core.strategy import V6Params, V6Strategy
+from core.twap_feed import ChainlinkTwapFeed
 from utils.analytics import Analytics
 
 LOG = logging.getLogger("v7.main")
@@ -93,6 +94,22 @@ class Runtime:
             (_finite_float(resolution_cfg.get("hard_deadline_s")) or 900.0) * 1000
         )
 
+        twap_cfg = cfg.get("chainlink_twap", {}) or {}
+        self.twap_enabled = bool(twap_cfg.get("enabled", True))
+        self.twap = ChainlinkTwapFeed(
+            twap_cfg.get("ws_url", "wss://ws-live-data.polymarket.com"),
+            topic=twap_cfg.get("topic", "prices.crypto.chainlink.twap"),
+            symbol=twap_cfg.get("symbol", "btc/usd"),
+            window_seconds=int(_finite_float(twap_cfg.get("window_seconds")) or 30),
+            stale_after_s=float(_finite_float(twap_cfg.get("stale_after_s")) or 120.0),
+            open_tolerance_ms=int(
+                (float(_finite_float(twap_cfg.get("open_tolerance_s")) or 60.0)) * 1000
+            ),
+            close_tolerance_ms=int(
+                (float(_finite_float(twap_cfg.get("close_tolerance_s")) or 45.0)) * 1000
+            ),
+        )
+
         self.state = StateManager(
             cfg.get("state", {}).get("path", "data/state.json"),
             lock_path=cfg.get("state", {}).get("lock_path"),
@@ -133,6 +150,11 @@ class Runtime:
         self.spot_open: float | None = None
         self.spot_now: float | None = None
         self.spot_close: float | None = None
+        self.twap_open: float | None = None
+        self.twap_close: float | None = None
+        self.twap_open_ts_ms: int | None = None
+        self.twap_close_ts_ms: int | None = None
+        self.twap_window_s: int | None = None
         self.move_distance: float | None = None
         self.spot_move: float | None = None
         self.imbalance: float | None = None
@@ -212,11 +234,13 @@ class Runtime:
         return None
 
     async def _resolve_market_winner(self) -> tuple[str | None, str]:
-        """Resolve the official winner, API first, WS cache second.
+        """Resolve the official winner from the Gamma API only.
 
-        The WS resolution cache is an official Polymarket signal too, but the
-        API must be asked first so a missing/stale cache can never silently
-        keep us on the local-spot fallback.
+        The WS cache is useful for display, but it is not sufficient for cash
+        settlement: the official market must be ``closed`` and its final
+        ``winner`` (or outcomePrices) must be readable.  If that is not
+        available, return None and keep the position PENDING instead of
+        guessing from spot or from a neighbouring market.
         """
         if self.market is None:
             return None, "no-market"
@@ -235,9 +259,6 @@ class Runtime:
                 exc,
             )
 
-        cached = self._resolve_winner_from_ws_cache()
-        if cached in {"UP", "DOWN"}:
-            return cached, "ws-cache"
         return None, "gamma-unresolved"
 
     async def _resolve_winner_for_position(self, p: Position) -> tuple[str | None, str]:
@@ -272,6 +293,11 @@ class Runtime:
         self.spot_open = None
         self.spot_now = None
         self.spot_close = None
+        self.twap_open = None
+        self.twap_close = None
+        self.twap_open_ts_ms = None
+        self.twap_close_ts_ms = None
+        self.twap_window_s = None
         self.move_distance = None
         self.spot_move = None
         self.imbalance = None
@@ -304,6 +330,29 @@ class Runtime:
             self.spot_open = spot
             self.spot_now = spot
 
+        # The official settlement reference is the Chainlink TWAP at the
+        # market's start, not Binance's tick.  Capture the closest RTDS tick
+        # once and freeze it; the local fallback must not read a later price.
+        twap_tick = self.twap.value_near(
+            self.market.start_ms,
+            tolerance_ms=self.twap.open_tolerance_ms,
+        )
+        if twap_tick is not None:
+            self.twap_open = float(twap_tick.value)
+            self.twap_open_ts_ms = int(twap_tick.timestamp_ms)
+            self.twap_window_s = int(twap_tick.window_seconds)
+            LOG.info(
+                "[MarketOpen] twap_open=%.4f ts=%s window=%ss source=chainlink",
+                self.twap_open,
+                self.twap_open_ts_ms,
+                self.twap_window_s,
+            )
+        else:
+            LOG.warning(
+                "[MarketOpen] no Chainlink TWAP near start market=%s; local fallback will remain unavailable",
+                self.market.slug,
+            )
+
         self.up_ready = bool(up and up.ready)
         self.down_ready = bool(down and down.ready)
         self.up_best_bid = up.best_bid if up else None
@@ -333,7 +382,7 @@ class Runtime:
         if self.mode != "paper":
             return
         for p in self.state.active_positions():
-            if p.status not in {"open", "PENDING_RESOLUTION"}:
+            if p.status not in {"open", "PENDING", "PENDING_RESOLUTION"}:
                 continue
             try:
                 fee_coef = float(getattr(self.executor, "fee_coefficient", 0.07))
@@ -410,78 +459,102 @@ class Runtime:
         self.indicators_ts_ms = now
 
     def _capture_close(self, now: int) -> None:
-        """Freeze the last Binance spot at the market close.
+        """Freeze the Chainlink TWAP at the exact market close.
 
-        The local fallback must not compare the entry price with a spot price
-        read two minutes later; that would settle a 5-minute market on a
-        post-close move.
+        Binance spot_close is still frozen for display, but the local fallback
+        must use Polymarket's official-synced Chainlink 30s TWAP.  The close
+        tick is selected once, near the boundary, and persisted with the
+        position so a restart cannot replace it with a later price.
         """
-        if self.market is None or self.spot_close is not None:
+        if self.market is None:
             return
         # Capture at/after the close, never one second early: a pre-close
         # print is not the settlement reference and can flip UP/DOWN.
         if now < self.market.end_ms:
             return
-        # Do not capture a "close" price minutes late after a restart.  A
-        # late observation is not the market close and must not be used for
-        # the local fallback.
-        if now > self.market.end_ms + 15_000:
+        if now > self.market.end_ms + 90_000:
             LOG.warning(
                 "[MarketClose] too late to capture close market=%s late_ms=%d",
                 self.market.slug,
                 now - self.market.end_ms,
             )
             return
-        spot = _positive_float(self.binance.spot())
-        if spot is None:
-            return
-        self.spot_close = spot
-        if self.trade_id:
-            self.state.update_position(self.trade_id, spot_close=spot)
-        LOG.info(
-            "[MarketClose] market=%s spot_close=%.6f",
-            self.market.slug,
-            spot,
-        )
+
+        if self.twap_close is None:
+            tick = self.twap.value_near(
+                self.market.end_ms,
+                tolerance_ms=self.twap.close_tolerance_ms,
+            )
+            if tick is not None:
+                self.twap_close = float(tick.value)
+                self.twap_close_ts_ms = int(tick.timestamp_ms)
+                self.twap_window_s = int(tick.window_seconds)
+                if self.trade_id:
+                    self.state.update_position(
+                        self.trade_id,
+                        twap_close=self.twap_close,
+                        twap_close_ts_ms=self.twap_close_ts_ms,
+                        twap_window_s=self.twap_window_s,
+                        twap_source="chainlink",
+                    )
+                LOG.info(
+                    "[MarketClose] market=%s twap_close=%.4f ts=%s window=%ss",
+                    self.market.slug,
+                    self.twap_close,
+                    self.twap_close_ts_ms,
+                    self.twap_window_s,
+                )
+            else:
+                LOG.warning(
+                    "[MarketClose] no Chainlink TWAP near close market=%s; fallback unavailable",
+                    self.market.slug,
+                )
+
+        # Binance close is retained only for diagnostics; it is never used for
+        # settlement after this patch.
+        if self.spot_close is None and now <= self.market.end_ms + 15_000:
+            spot = _positive_float(self.binance.spot())
+            if spot is not None:
+                self.spot_close = spot
+                if self.trade_id:
+                    self.state.update_position(self.trade_id, spot_close=spot)
+                LOG.info(
+                    "[MarketClose] market=%s spot_close=%.6f (display only)",
+                    self.market.slug,
+                    spot,
+                )
 
     def _local_winner_for_position(self, p: Position) -> tuple[str | None, str]:
-        """Emergency UP/DOWN decision after the official 5-minute timeout.
+        """Last-resort local decision after the official 5-minute timeout.
 
-        For the still-current market use the live Binance spot at the fallback
-        moment, as requested.  For an old/recovered market only the frozen
-        close is meaningful; using a later spot would price a different market.
+        This is deliberately NOT the normal settlement path.  It uses only the
+        Chainlink 30s TWAP frozen for this exact position at its market start
+        and end; it never reads Binance spot or a later live price.  If either
+        TWAP is unavailable, return None and keep the position unresolved.
         """
-        spot_open = _positive_float(p.spot_open)
-        spot_close = _positive_float(p.spot_close)
-        source = "local-spot-close"
-        if self.market is not None and p.market_slug == self.market.slug:
-            spot_open = _positive_float(self.spot_open) or spot_open
-            live_close = _positive_float(self.spot_now) or _positive_float(self.binance.spot())
-            if live_close is not None:
-                spot_close = live_close
-                source = "local-spot-now"
-            elif spot_close is None:
-                spot_close = _positive_float(self.spot_close)
+        twap_open = _positive_float(p.twap_open)
+        twap_close = _positive_float(p.twap_close)
+        source = "LOCAL_FALLBACK_TIMEOUT"
 
-        if spot_open is None or spot_close is None:
+        if twap_open is None or twap_close is None:
             LOG.warning(
-                "[Resolve] local fallback unavailable market=%s spot_open=%s spot_close=%s",
+                "[Resolve] local fallback unavailable market=%s twap_open=%s twap_close=%s",
                 p.market_slug,
-                spot_open,
-                spot_close,
+                twap_open,
+                twap_close,
             )
-            return None, "local-spot-no-data"
-        if spot_close > spot_open:
+            return None, "local-fallback-no-twap"
+        if twap_close > twap_open:
             return "UP", source
-        if spot_close < spot_open:
+        if twap_close < twap_open:
             return "DOWN", source
         LOG.warning(
-            "[Resolve] local fallback tie market=%s spot_open=%.6f spot_close=%.6f",
+            "[Resolve] local fallback tie market=%s twap_open=%.6f twap_close=%.6f",
             p.market_slug,
-            spot_open,
-            spot_close,
+            twap_open,
+            twap_close,
         )
-        return None, "local-spot-tie"
+        return None, "local-fallback-twap-tie"
 
     def _can_enter(self) -> tuple[bool, str]:
         active = len(self.state.active_positions())
@@ -534,6 +607,12 @@ class Runtime:
             neg_risk=sig.market.neg_risk,
             spot_open=_finite_float(self.spot_open),
             spot_close=None,
+            twap_open=_positive_float(self.twap_open),
+            twap_close=None,
+            twap_open_ts_ms=self.twap_open_ts_ms,
+            twap_close_ts_ms=None,
+            twap_window_s=self.twap_window_s,
+            twap_source="chainlink" if self.twap_open is not None else None,
         )
         if not self.state.add_position(pos):
             return
@@ -596,11 +675,42 @@ class Runtime:
         now = now_ms()
         active = [
             p for p in self.state.active_positions()
-            if p.status in {"open", "PENDING_RESOLUTION"}
+            if p.status in {"open", "PENDING", "PENDING_RESOLUTION"}
         ]
         fee_coef = float(getattr(self.executor, "fee_coefficient", 0.07))
 
         for p in active:
+            # At the exact market close, stop pretending this is an open
+            # position.  PENDING is persisted before the first API poll; the
+            # official result is the only thing allowed to book a WIN/LOSS.
+            if p.status == "open" and now >= p.end_time_ms:
+                self.state.update_position(
+                    p.trade_id,
+                    status="PENDING",
+                    last_error="waiting-official-resolution",
+                )
+                LOG.info(
+                    "[Paper] market closed; PENDING official resolution market=%s",
+                    p.market_slug,
+                )
+                print(
+                    f"[结算] 盘口 {p.market_slug} 结束 | "
+                    f"等待 Polymarket 官方结果 | status=PENDING",
+                    flush=True,
+                )
+                if p.trade_id == self.trade_id:
+                    # The position stays in state and is settled by the
+                    # PENDING poller; releasing the runtime fill lets the
+                    # next 5m market start without losing the position.
+                    self._clear_paper_fill()
+                p.status = "PENDING"
+
+            # Legacy PENDING_RESOLUTION records from the previous patch are
+            # treated identically, but new records use PENDING.
+            if p.status == "PENDING_RESOLUTION":
+                self.state.update_position(p.trade_id, status="PENDING")
+                p.status = "PENDING"
+
             if now < p.end_time_ms + self.resolution_start_buffer_ms:
                 continue
 
@@ -617,19 +727,12 @@ class Runtime:
                 self.state.update_position(p.trade_id, last_attempt_ms=now)
                 winner, source = await self._resolve_winner_for_position(p)
                 if winner is None:
-                    was_open = p.status == "open"
                     self.state.update_position(
                         p.trade_id,
-                        status="PENDING_RESOLUTION",
+                        status="PENDING",
                         last_attempt_ms=now,
                         last_error="waiting-official-resolution",
                     )
-                    if was_open:
-                        print(
-                            f"[结算] 等待 Polymarket 官方结果 market={p.market_slug} "
-                            f"status=PENDING_RESOLUTION",
-                            flush=True,
-                        )
                     continue
             else:
                 # Five-minute official timeout: one last official attempt, then
@@ -645,8 +748,11 @@ class Runtime:
                         already = str(p.last_error or "").startswith("fallback:")
                         if not already:
                             print(
-                                f"[警告] 官方结算超时，启用本地兜底 market={p.market_slug} "
-                                f"source={source}",
+                                f"[警告] 官方结算超时，启用本地 Chainlink TWAP 兜底 "
+                                f"market={p.market_slug} source={source} "
+                                f"twap_open={_finite_float(p.twap_open)} "
+                                f"twap_close={_finite_float(p.twap_close)} "
+                                f"window={p.twap_window_s}s",
                                 flush=True,
                             )
                             LOG.warning(
@@ -656,8 +762,8 @@ class Runtime:
                             )
                         self.state.update_position(
                             p.trade_id,
-                            status="PENDING_RESOLUTION",
-                            last_error="fallback:local-spot",
+                            status="PENDING",
+                            last_error="fallback:LOCAL_FALLBACK_TIMEOUT",
                         )
 
             if winner is None:
@@ -727,11 +833,12 @@ class Runtime:
                     source=source,
                 )
                 held = "YES" if p.side.upper() in {"UP", "YES"} else "NO"
-                spot_detail = ""
-                if source.startswith("local-spot"):
-                    spot_detail = (
-                        f" spot_open={_finite_float(p.spot_open)}"
-                        f" spot_close={_finite_float(p.spot_close)}"
+                twap_detail = ""
+                if str(source).lower().startswith("local"):
+                    twap_detail = (
+                        f" twap_open={_finite_float(p.twap_open)}"
+                        f" twap_close={_finite_float(p.twap_close)}"
+                        f" twap_window={p.twap_window_s}s"
                     )
                 print(
                     f"[结算] 盘口 {p.market_slug} 结束 | 最终赢家: {winner} | "
@@ -739,7 +846,7 @@ class Runtime:
                     f"来源: {source} | 份数: {shares:.4f} | 成本: {cost:.4f} | "
                     f"回收: {payout:.4f} | 盈亏: {pnl:+.4f} | "
                     f"最新余额: {self.analytics.balance:.4f} | "
-                    f"executor_balance: {self.executor.balance:.4f}{spot_detail}",
+                    f"executor_balance: {self.executor.balance:.4f}{twap_detail}",
                     flush=True,
                 )
                 closed = self.state.close_trade(
@@ -784,10 +891,9 @@ class Runtime:
                 if p.trade_id == self.trade_id:
                     self._clear_paper_fill()
         if self.paper_fill is not None and self.trade_id:
-            still_active = {
-                p.trade_id for p in self.state.active_positions()
-            }
-            if self.trade_id not in still_active:
+            positions = {p.trade_id: p for p in self.state.active_positions()}
+            pos = positions.get(self.trade_id)
+            if pos is None or pos.status in {"PENDING", "PENDING_RESOLUTION"}:
                 self._clear_paper_fill()
 
     def _compact_status_snapshot(self) -> dict[str, Any]:
@@ -904,11 +1010,13 @@ class Runtime:
         now = now_ms()
         self._capture_close(now)
 
-        # Settle any open paper position whose market has closed, even if a
-        # newer market is already active (recovered positions included).
+        # Settle any paper position whose market has closed, even if a newer
+        # market is already active (recovered positions included).  This must
+        # run at the close, not only after the 15s buffer, so the position is
+        # persisted as PENDING immediately.
         if self.mode == "paper" and any(
-            p.status == "open"
-            and now >= p.end_time_ms + self.resolution_start_buffer_ms
+            p.status in {"open", "PENDING", "PENDING_RESOLUTION"}
+            and now >= p.end_time_ms
             for p in self.state.active_positions()
         ):
             await self._settle_paper()
@@ -1020,6 +1128,8 @@ class Runtime:
 
         await runtime.pm.start()
         await runtime.binance.start()
+        if runtime.twap_enabled:
+            await runtime.twap.start()
 
         asyncio.create_task(runtime._emit_startup_health_panel(), name="startup-health-panel")
 
@@ -1051,6 +1161,10 @@ class Runtime:
                 await runtime.binance.stop()
             except Exception:
                 LOG.exception("failed to stop Binance feed")
+            try:
+                await runtime.twap.stop()
+            except Exception:
+                LOG.exception("failed to stop Chainlink TWAP feed")
             LOG.info("V7 stopped")
 
         return 0
