@@ -29,7 +29,13 @@ except Exception:  # noqa: BLE001
 
 LOG = logging.getLogger("v7.state")
 
-ACTIVE_STATUSES = {"pending_fill", "open", "redeem_pending", "unresolved"}
+ACTIVE_STATUSES = {
+    "pending_fill",
+    "open",
+    "PENDING_RESOLUTION",
+    "redeem_pending",
+    "unresolved",
+}
 FINAL_STATUSES = {"redeemed", "lost", "cancelled"}
 
 
