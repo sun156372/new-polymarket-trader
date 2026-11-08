@@ -81,16 +81,16 @@ class Runtime:
 
         resolution_cfg = cfg.get("resolution", {})
         self.resolution_start_buffer_ms = int(
-            (_finite_float(resolution_cfg.get("start_buffer_s")) or 10.0) * 1000
+            (_finite_float(resolution_cfg.get("start_buffer_s")) or 15.0) * 1000
         )
         self.resolution_poll_interval_ms = int(
             (_finite_float(resolution_cfg.get("poll_interval_s")) or 5.0) * 1000
         )
         self.resolution_fallback_ms = int(
-            (_finite_float(resolution_cfg.get("fallback_after_s")) or 120.0) * 1000
+            (_finite_float(resolution_cfg.get("fallback_after_s")) or 300.0) * 1000
         )
         self.resolution_hard_deadline_ms = int(
-            (_finite_float(resolution_cfg.get("hard_deadline_s")) or 300.0) * 1000
+            (_finite_float(resolution_cfg.get("hard_deadline_s")) or 900.0) * 1000
         )
 
         self.state = StateManager(
@@ -212,13 +212,14 @@ class Runtime:
         return None
 
     async def _resolve_market_winner(self) -> tuple[str | None, str]:
-        """Best-effort final winner resolution with WS + Gamma fallback."""
+        """Resolve the official winner, API first, WS cache second.
+
+        The WS resolution cache is an official Polymarket signal too, but the
+        API must be asked first so a missing/stale cache can never silently
+        keep us on the local-spot fallback.
+        """
         if self.market is None:
             return None, "no-market"
-
-        cached = self._resolve_winner_from_ws_cache()
-        if cached in {"UP", "DOWN"}:
-            return cached, "ws-cache"
 
         # Resolve the exact market only.  Never probe neighbouring 5m slugs:
         # a delayed or failed lookup could settle this position with the
@@ -234,7 +235,10 @@ class Runtime:
                 exc,
             )
 
-        return None, "unresolved"
+        cached = self._resolve_winner_from_ws_cache()
+        if cached in {"UP", "DOWN"}:
+            return cached, "ws-cache"
+        return None, "gamma-unresolved"
 
     async def _resolve_winner_for_position(self, p: Position) -> tuple[str | None, str]:
         """Resolve a specific position's market, including recovered old markets."""
@@ -329,7 +333,7 @@ class Runtime:
         if self.mode != "paper":
             return
         for p in self.state.active_positions():
-            if p.status != "open":
+            if p.status not in {"open", "PENDING_RESOLUTION"}:
                 continue
             try:
                 fee_coef = float(getattr(self.executor, "fee_coefficient", 0.07))
@@ -337,7 +341,8 @@ class Runtime:
                 cost = p.shares * p.entry_price + fee
                 self.executor.balance -= cost
                 self.analytics.debit_entry(cost)
-                self.state.ensure_open_record(p, cost_usdc=cost)
+                if p.status == "open":
+                    self.state.ensure_open_record(p, cost_usdc=cost)
                 LOG.info(
                     "[Paper] recovered open position cost=%.4f market=%s",
                     cost,
@@ -440,13 +445,23 @@ class Runtime:
         )
 
     def _local_winner_for_position(self, p: Position) -> tuple[str | None, str]:
-        """Last-resort UP/DOWN decision from frozen spot open/close."""
+        """Emergency UP/DOWN decision after the official 5-minute timeout.
+
+        For the still-current market use the live Binance spot at the fallback
+        moment, as requested.  For an old/recovered market only the frozen
+        close is meaningful; using a later spot would price a different market.
+        """
         spot_open = _positive_float(p.spot_open)
         spot_close = _positive_float(p.spot_close)
-        if spot_close is None and self.market is not None and p.market_slug == self.market.slug:
-            spot_close = _positive_float(self.spot_close)
-        if spot_open is None and self.market is not None and p.market_slug == self.market.slug:
-            spot_open = _positive_float(self.spot_open)
+        source = "local-spot-close"
+        if self.market is not None and p.market_slug == self.market.slug:
+            spot_open = _positive_float(self.spot_open) or spot_open
+            live_close = _positive_float(self.spot_now) or _positive_float(self.binance.spot())
+            if live_close is not None:
+                spot_close = live_close
+                source = "local-spot-now"
+            elif spot_close is None:
+                spot_close = _positive_float(self.spot_close)
 
         if spot_open is None or spot_close is None:
             LOG.warning(
@@ -457,9 +472,9 @@ class Runtime:
             )
             return None, "local-spot-no-data"
         if spot_close > spot_open:
-            return "UP", "local-spot-close"
+            return "UP", source
         if spot_close < spot_open:
-            return "DOWN", "local-spot-close"
+            return "DOWN", source
         LOG.warning(
             "[Resolve] local fallback tie market=%s spot_open=%.6f spot_close=%.6f",
             p.market_slug,
@@ -549,6 +564,7 @@ class Runtime:
                 self.trade_id = trade_id
                 self.paper_settle_started_ms = now_ms()
                 self.paper_settle_deadline_ms = self.market.end_ms + 300_000 if self.market else None
+            self.analytics.note_entry()
             self.analytics.note_position_change()
             print(
                 f"[{'Paper' if self.mode == 'paper' else 'Live'}] 买入"
@@ -578,39 +594,71 @@ class Runtime:
             return
 
         now = now_ms()
-        active = [p for p in self.state.active_positions() if p.status == "open"]
+        active = [
+            p for p in self.state.active_positions()
+            if p.status in {"open", "PENDING_RESOLUTION"}
+        ]
         fee_coef = float(getattr(self.executor, "fee_coefficient", 0.07))
 
         for p in active:
-            # Wait for the exchange clock/network to settle, then poll the
-            # Gamma market at a bounded rate.  Never spin once per 250ms step.
             if now < p.end_time_ms + self.resolution_start_buffer_ms:
                 continue
 
             fallback_at = p.end_time_ms + self.resolution_fallback_ms
             last_attempt = p.last_attempt_ms or 0
+            winner: str | None = None
+            source = "gamma-unresolved"
 
-            # After the fallback deadline, prefer the frozen local close and
-            # do not touch the API again.  Before then, poll at a bounded
-            # rate; this branch must not run once per 250ms main-loop tick.
-            local_winner = None
-            local_source = ""
-            if now >= fallback_at:
-                local_winner, local_source = self._local_winner_for_position(p)
-
-            if local_winner in {"UP", "DOWN"}:
-                winner, source = local_winner, local_source
-            else:
+            # Official result first.  Never settle from local spot inside this
+            # window: the local comparison is only an emergency fallback.
+            if now < fallback_at:
                 if now - last_attempt < self.resolution_poll_interval_ms:
                     continue
-
                 self.state.update_position(p.trade_id, last_attempt_ms=now)
                 winner, source = await self._resolve_winner_for_position(p)
-
-                # Official resolution stuck (closed=false, resolved=false,
-                # API error) and local fallback has no usable close.
-                if winner is None and now >= fallback_at:
-                    source = f"{source};{local_source}"
+                if winner is None:
+                    was_open = p.status == "open"
+                    self.state.update_position(
+                        p.trade_id,
+                        status="PENDING_RESOLUTION",
+                        last_attempt_ms=now,
+                        last_error="waiting-official-resolution",
+                    )
+                    if was_open:
+                        print(
+                            f"[结算] 等待 Polymarket 官方结果 market={p.market_slug} "
+                            f"status=PENDING_RESOLUTION",
+                            flush=True,
+                        )
+                    continue
+            else:
+                # Five-minute official timeout: one last official attempt, then
+                # the frozen local close may be used.  This branch is explicit
+                # and loudly logged; it is not the normal settlement path.
+                if now - last_attempt >= self.resolution_poll_interval_ms:
+                    self.state.update_position(p.trade_id, last_attempt_ms=now)
+                    winner, source = await self._resolve_winner_for_position(p)
+                if winner is None:
+                    local_winner, local_source = self._local_winner_for_position(p)
+                    if local_winner in {"UP", "DOWN"}:
+                        winner, source = local_winner, local_source
+                        already = str(p.last_error or "").startswith("fallback:")
+                        if not already:
+                            print(
+                                f"[警告] 官方结算超时，启用本地兜底 market={p.market_slug} "
+                                f"source={source}",
+                                flush=True,
+                            )
+                            LOG.warning(
+                                "[Paper] official resolution timeout; local fallback market=%s source=%s",
+                                p.market_slug,
+                                source,
+                            )
+                        self.state.update_position(
+                            p.trade_id,
+                            status="PENDING_RESOLUTION",
+                            last_error="fallback:local-spot",
+                        )
 
             if winner is None:
                 if now >= p.end_time_ms + self.resolution_hard_deadline_ms:
@@ -676,6 +724,7 @@ class Runtime:
                     market=p.market_slug,
                     side=p.side,
                     payout=payout,
+                    source=source,
                 )
                 held = "YES" if p.side.upper() in {"UP", "YES"} else "NO"
                 spot_detail = ""
@@ -734,7 +783,6 @@ class Runtime:
                 )
                 if p.trade_id == self.trade_id:
                     self._clear_paper_fill()
-
         if self.paper_fill is not None and self.trade_id:
             still_active = {
                 p.trade_id for p in self.state.active_positions()
