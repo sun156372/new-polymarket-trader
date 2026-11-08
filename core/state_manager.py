@@ -32,7 +32,8 @@ LOG = logging.getLogger("v7.state")
 ACTIVE_STATUSES = {
     "pending_fill",
     "open",
-    "PENDING_RESOLUTION",
+    "PENDING",
+    "PENDING_RESOLUTION",  # legacy status from the previous settlement patch
     "redeem_pending",
     "unresolved",
 }
@@ -58,6 +59,24 @@ def _canonical_side(side: str) -> str:
     return value
 
 
+_TWAP_HISTORY_FIELDS = (
+    "twap_open",
+    "twap_close",
+    "twap_open_ts_ms",
+    "twap_close_ts_ms",
+    "twap_window_s",
+    "twap_source",
+)
+
+
+def _copy_twap_fields(record: dict[str, Any], pos: dict[str, Any] | None) -> None:
+    if not pos:
+        return
+    for key in _TWAP_HISTORY_FIELDS:
+        if pos.get(key) is not None:
+            record[key] = pos[key]
+
+
 @dataclass
 class Position:
     trade_id: str
@@ -79,9 +98,16 @@ class Position:
     last_attempt_ms: int | None = None
     neg_risk: bool = False
     # Frozen at entry/close so a restarted process can still make the local
-    # spot fallback decision without current-price drift.
+    # fallback decision without current-price drift.  spot_* is for display;
+    # the local fallback uses the official-synced Chainlink TWAP fields below.
     spot_open: float | None = None
     spot_close: float | None = None
+    twap_open: float | None = None
+    twap_close: float | None = None
+    twap_open_ts_ms: int | None = None
+    twap_close_ts_ms: int | None = None
+    twap_window_s: int | None = None
+    twap_source: str | None = None
     resolution_source: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -306,6 +332,7 @@ class StateManager:
                 "status": "OPEN",
                 "payout": None,
             }
+            _copy_twap_fields(record, pos)
             existing = next(
                 (row for row in history if row.get("trade_id") == trade_id),
                 None,
@@ -390,6 +417,7 @@ class StateManager:
                 record["cost_usdc"] = float(cost_usdc)
             if source:
                 record["resolution_source"] = str(source)
+            _copy_twap_fields(record, pos)
 
             if pos is not None:
                 data["positions"] = [
