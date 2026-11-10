@@ -35,7 +35,6 @@ ACTIVE_STATUSES = {
     "PENDING",
     "PENDING_RESOLUTION",  # legacy status from the previous settlement patch
     "redeem_pending",
-    "unresolved",
 }
 FINAL_STATUSES = {"redeemed", "lost", "cancelled"}
 
