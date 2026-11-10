@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """V7 entrypoint: paper or live, final-240s V6 strategy, crash recovery, auto-redeem."""
 from __future__ import annotations
@@ -264,6 +265,13 @@ class Runtime:
     async def _resolve_winner_for_position(self, p: Position) -> tuple[str | None, str]:
         """Resolve a specific position's market, including recovered old markets."""
         if self.market is not None and p.market_slug == self.market.slug:
+            # A WS resolution is only a fast path for the exact current
+            # market.  The cache lookup checks condition_id, slug and both
+            # token ids, so an unrelated market_resolved event cannot settle
+            # this position.
+            ws_winner = self._resolve_winner_from_ws_cache()
+            if ws_winner in {"UP", "DOWN"}:
+                return ws_winner, "ws_market_resolved"
             return await self._resolve_market_winner()
 
         try:
@@ -675,28 +683,9 @@ class Runtime:
         now = now_ms()
         active = [
             p for p in self.state.active_positions()
-            if p.status in {"open", "PENDING", "PENDING_RESOLUTION", "unresolved"}
+            if p.status in {"open", "PENDING", "PENDING_RESOLUTION"}
         ]
-
         fee_coef = float(getattr(self.executor, "fee_coefficient", 0.07))
-
-        # --- startup / periodic cleanup: remove stale unresolved zombies ---
-        for p in list(self.state.active_positions()):
-            if p.status == "unresolved":
-                age_ms = now - (p.last_attempt_ms or p.opened_at_ms)
-                if age_ms > 86_400_000:
-                    print(
-                        f"[Zombie] 清理僵尸单 trade_id={p.trade_id} market={p.market_slug} "
-                        f"status={p.status} opened={p.opened_at_ms} now={now} age_ms={age_ms}",
-                        flush=True,
-                    )
-                    LOG.warning(
-                        "[Zombie] removing stale unresolved position trade_id=%s market=%s age_ms=%d",
-                        p.trade_id,
-                        p.market_slug,
-                        age_ms,
-                    )
-                    self.state.remove_position(p.trade_id)
 
         for p in active:
             # At the exact market close, stop pretending this is an open
@@ -718,6 +707,9 @@ class Runtime:
                     flush=True,
                 )
                 if p.trade_id == self.trade_id:
+                    # The position stays in state and is settled by the
+                    # PENDING poller; releasing the runtime fill lets the
+                    # next 5m market start without losing the position.
                     self._clear_paper_fill()
                 p.status = "PENDING"
 
@@ -779,131 +771,8 @@ class Runtime:
                         self.state.update_position(
                             p.trade_id,
                             status="PENDING",
-                            last_error=f"fallback:{source}",
+                            last_error="fallback:LOCAL_FALLBACK_TIMEOUT",
                         )
-
-            # --- forced fallback after 180 seconds past market end when Gamma is still unresolved ---
-            if winner is None and now >= p.end_time_ms + 180_000:
-                spot_open = _positive_float(p.spot_open)
-                spot_close = _positive_float(p.spot_close)
-
-                if spot_open is None:
-                    spot_open = _positive_float(self.spot_open)
-                if spot_close is None:
-                    spot_close = _positive_float(self.spot_close)
-
-                # Prefer the frozen position snapshot over live market state.
-                if spot_open is not None and spot_close is not None:
-                    if spot_close > spot_open:
-                        winner = "UP"
-                        source = "force_local_spot_fallback"
-                    elif spot_close < spot_open:
-                        winner = "DOWN"
-                        source = "force_local_spot_fallback"
-                    else:
-                        winner = None
-                        source = "gamma-unresolved"
-
-                if winner is not None:
-                    print(
-                        f"[强制兜底] market={p.market_slug} side={p.side} "
-                        f"spot_open={spot_open} spot_close={spot_close} winner={winner} "
-                        f"source={source} end_time_ms={p.end_time_ms} now_ms={now}",
-                        flush=True,
-                    )
-                    LOG.warning(
-                        "[Paper] forced local spot fallback winner=%s market=%s source=%s "
-                        "spot_open=%.6f spot_close=%.6f",
-                        winner,
-                        p.market_slug,
-                        source,
-                        spot_open,
-                        spot_close,
-                    )
-
-                    shares = float(p.shares)
-                    entry = float(p.entry_price)
-                    fee = shares * fee_coef * entry * (1.0 - entry)
-                    cost = shares * entry + fee
-                    side = str(p.side).strip().upper()
-                    if side == "YES":
-                        side = "UP"
-                    elif side == "NO":
-                        side = "DOWN"
-                    if side not in {"UP", "DOWN"}:
-                        raise ValueError(f"invalid position side: {p.side!r}")
-
-                    won = side == winner
-                    payout = shares if won else 0.0
-                    final_price = 1.0 if won else 0.0
-
-                    fill_for_settle = Fill(
-                        market_slug=p.market_slug,
-                        side=p.side,
-                        token_id=p.token_id,
-                        entry_price=entry,
-                        shares=shares,
-                        stake_usdc=cost,
-                        fee_usdc=fee,
-                        order_id=p.order_id,
-                        raw={
-                            "paper": True,
-                            "resolution_source": source,
-                            "spot_open": spot_open,
-                            "spot_close": spot_close,
-                            "forced": True,
-                        },
-                    )
-
-                    pnl = self.executor.settle_paper(fill_for_settle, winner)
-                    if not all(math.isfinite(v) for v in (cost, payout, pnl)):
-                        raise ValueError(
-                            f"invalid settlement math: cost={cost!r} payout={payout!r} pnl={pnl!r}"
-                        )
-
-                    self.analytics.record(
-                        pnl=pnl,
-                        stake=cost,
-                        won=won,
-                        market=p.market_slug,
-                        side=p.side,
-                        payout=payout,
-                        source=source,
-                    )
-                    self.state.update_position(
-                        p.trade_id,
-                        resolution_source=source,
-                    )
-
-                    closed = self.state.close_trade(
-                        p.trade_id,
-                        status="WIN" if won else "LOSS",
-                        payout=payout,
-                        pnl=pnl,
-                        cost_usdc=cost,
-                        source=source,
-                        settled_at_ms=now,
-                    )
-                    if not closed:
-                        self.state.update_position(
-                            p.trade_id,
-                            status="unresolved",
-                            last_error="settlement accounting done but history/position missing",
-                        )
-
-                    LOG.info(
-                        "[Paper] forced fallback settled market=%s side=%s winner=%s source=%s "
-                        "payout=%.4f pnl=%+.4f cost=%.4f closed=%s",
-                        p.market_slug,
-                        p.side,
-                        winner,
-                        source,
-                        payout,
-                        pnl,
-                        cost,
-                        closed,
-                    )
-                    continue
 
             if winner is None:
                 if now >= p.end_time_ms + self.resolution_hard_deadline_ms:
@@ -930,7 +799,7 @@ class Runtime:
             try:
                 shares = float(p.shares)
                 entry = float(p.entry_price)
-                fee = shares * fee_coef * entry * (1.0 - entry)
+                fee = shares * fee_coef * entry * (1 - entry)
                 cost = shares * entry + fee
                 side = str(p.side).strip().upper()
                 if side == "YES":
@@ -939,7 +808,6 @@ class Runtime:
                     side = "DOWN"
                 if side not in {"UP", "DOWN"}:
                     raise ValueError(f"invalid position side: {p.side!r}")
-
                 won = side == winner
                 payout = shares if won else 0.0
                 final_price = 1.0 if won else 0.0
@@ -955,7 +823,8 @@ class Runtime:
                     order_id=p.order_id,
                     raw={"paper": True, "resolution_source": source},
                 )
-
+                # The executor is the single owner of paper cash: it has
+                # already debited the entry cost and now adds the payout.
                 pnl = self.executor.settle_paper(fill_for_settle, winner)
                 if not all(math.isfinite(v) for v in (cost, payout, pnl)):
                     raise ValueError(
@@ -971,16 +840,14 @@ class Runtime:
                     payout=payout,
                     source=source,
                 )
+                held = "YES" if p.side.upper() in {"UP", "YES"} else "NO"
+                twap_detail = ""
                 if str(source).lower().startswith("local"):
-                    # local TWAP fallback logs can include the frozen reference
                     twap_detail = (
                         f" twap_open={_finite_float(p.twap_open)}"
                         f" twap_close={_finite_float(p.twap_close)}"
                         f" twap_window={p.twap_window_s}s"
                     )
-                else:
-                    twap_detail = ""
-
                 print(
                     f"[结算] 盘口 {p.market_slug} 结束 | 最终赢家: {winner} | "
                     f"我的持仓: {held} ({p.side}) | 最终价格: {final_price:.4f} | "
@@ -990,8 +857,6 @@ class Runtime:
                     f"executor_balance: {self.executor.balance:.4f}{twap_detail}",
                     flush=True,
                 )
-
-                held = "YES" if p.side.upper() in {"UP", "YES"} else "NO"
                 closed = self.state.close_trade(
                     p.trade_id,
                     status="WIN" if won else "LOSS",
@@ -1002,6 +867,8 @@ class Runtime:
                     settled_at_ms=now,
                 )
                 if not closed:
+                    # Accounting already happened.  Never leave the position
+                    # open, or the next step would pay it out a second time.
                     self.state.update_position(
                         p.trade_id,
                         status="unresolved",
@@ -1011,7 +878,6 @@ class Runtime:
                         "[Paper] settlement accounting done but history/position missing trade_id=%s",
                         p.trade_id,
                     )
-
                 LOG.info(
                     "[Paper] settled market=%s side=%s winner=%s source=%s payout=%.4f pnl=%+.4f cost=%.4f closed=%s",
                     p.market_slug,
@@ -1032,7 +898,6 @@ class Runtime:
                 )
                 if p.trade_id == self.trade_id:
                     self._clear_paper_fill()
-
         if self.paper_fill is not None and self.trade_id:
             positions = {p.trade_id: p for p in self.state.active_positions()}
             pos = positions.get(self.trade_id)
@@ -1183,7 +1048,6 @@ class Runtime:
 
         secs = (self.market.end_ms - now) / 1000.0
         in_entry_window = secs <= self.params.entry_t_minus_s
-
         self._log_market_snapshot_once(at_decision=in_entry_window)
 
         if not self.entry_done and in_entry_window:
