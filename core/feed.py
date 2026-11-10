@@ -772,11 +772,155 @@ class PolymarketFeed:
             tick.last_update_ms = now_ms()
             tick.raw = msg
 
+    @staticmethod
+    def _resolution_market_keys(payload: dict[str, Any]) -> tuple[set[str], set[str]]:
+        """Return (market keys, token keys) from a resolution event.
+
+        Only identifiers explicitly present in the event are accepted.  A
+        resolution event without a market/token identity is deliberately
+        ignored: a global "winner" without an owner is worse than no fast path.
+        """
+
+        market_keys: set[str] = set()
+        token_keys: set[str] = set()
+
+        for key in ("market_slug", "marketSlug", "slug", "condition_id", "conditionId", "market_id", "marketId"):
+            value = payload.get(key)
+            if value is not None and str(value).strip():
+                market_keys.add(str(value).strip())
+
+        for key in ("token_id", "tokenId", "asset_id", "assetId", "clobTokenId", "clob_token_id"):
+            value = payload.get(key)
+            if value is not None and str(value).strip():
+                token_keys.add(str(value).strip())
+
+        market = payload.get("market")
+        if isinstance(market, dict):
+            for key in ("slug", "market_slug", "condition_id", "conditionId", "id"):
+                value = market.get(key)
+                if value is not None and str(value).strip():
+                    market_keys.add(str(value).strip())
+        elif market is not None and str(market).strip():
+            market_keys.add(str(market).strip())
+
+        assets = payload.get("assets_ids") or payload.get("assetsIds") or payload.get("tokens")
+        if isinstance(assets, str):
+            try:
+                assets = json.loads(assets)
+            except Exception:
+                assets = [assets]
+        if isinstance(assets, (list, tuple)):
+            for item in assets:
+                if item is not None and str(item).strip():
+                    token_keys.add(str(item).strip())
+
+        return market_keys, token_keys
+
+    @staticmethod
+    def _resolution_winner(payload: dict[str, Any]) -> str | None:
+        """Extract an explicit winner, falling back to a final price pair."""
+
+        for key in ("winner", "winningOutcome", "winning_outcome", "winnerOutcome",
+                    "winningOutcomeName", "winnerName", "outcomeWinner", "resolvedOutcome", "outcome"):
+            if key in payload and payload.get(key) is not None:
+                side = MarketDiscovery._side_from_outcome(payload.get(key))
+                if side is not None:
+                    return side
+
+        outcomes = payload.get("outcomes") or payload.get("outcomeNames")
+        if isinstance(outcomes, str):
+            try:
+                outcomes = json.loads(outcomes)
+            except Exception:
+                outcomes = []
+        labels = [str(x).strip() for x in outcomes] if isinstance(outcomes, (list, tuple)) else []
+
+        for key in ("winningOutcomeIndex", "winnerOutcomeIndex"):
+            if key in payload and payload.get(key) is not None:
+                try:
+                    index = int(float(payload[key]))
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= index < len(labels):
+                    side = MarketDiscovery._side_from_outcome(labels[index])
+                    if side is not None:
+                        return side
+
+        prices = payload.get("outcomePrices") or payload.get("outcome_prices")
+        if isinstance(prices, str):
+            try:
+                prices = json.loads(prices)
+            except Exception:
+                prices = []
+        if len(labels) >= 2 and isinstance(prices, (list, tuple)) and len(prices) >= 2:
+            numeric: list[float] = []
+            for item in prices[: len(labels)]:
+                parsed = _parse_float(item)
+                if parsed is None:
+                    return None
+                numeric.append(parsed)
+            high = max(numeric)
+            low = min(numeric)
+            if high >= 0.98 and low <= 0.02:
+                return MarketDiscovery._side_from_outcome(labels[numeric.index(high)])
+        return None
+
+    def apply_market_resolution(self, message: dict[str, Any]) -> None:
+        """Cache a resolution only when it names both a market/token and a winner."""
+
+        payload: dict[str, Any] = message
+        for key in ("payload", "data", "result"):
+            value = message.get(key)
+            if isinstance(value, dict):
+                payload = value
+                break
+
+        market_keys, token_keys = self._resolution_market_keys(payload)
+        if not market_keys and not token_keys:
+            # Try the outer envelope for identity only; never accept an
+            # unowned winner from a global event.
+            outer_markets, outer_tokens = self._resolution_market_keys(message)
+            market_keys |= outer_markets
+            token_keys |= outer_tokens
+        if not market_keys and not token_keys:
+            LOG.warning("[PM] market_resolved ignored: missing market/token identity")
+            return
+
+        winner = self._resolution_winner(payload)
+        if winner is None and payload is not message:
+            winner = self._resolution_winner(message)
+        if winner is None:
+            LOG.warning(
+                "[PM] market_resolved ignored: missing explicit winner market=%s",
+                sorted(market_keys)[:1],
+            )
+            return
+
+        for key in market_keys:
+            self.market_resolution_cache[key] = winner
+        for key in token_keys:
+            self.asset_resolution_cache[key] = winner
+        while len(self.market_resolution_cache) > 4096:
+            self.market_resolution_cache.pop(next(iter(self.market_resolution_cache)))
+        while len(self.asset_resolution_cache) > 8192:
+            self.asset_resolution_cache.pop(next(iter(self.asset_resolution_cache)))
+
+        LOG.info(
+            "[PM] market_resolved market=%s token=%s winner=%s",
+            sorted(market_keys)[:1],
+            sorted(token_keys)[:1],
+            winner,
+        )
+
     def on_message(self, message: Any) -> None:
         if not isinstance(message, dict):
             return
 
         event_type = self._event_type(message)
+        if event_type in {"market_resolved", "market_resolution"}:
+            self.apply_market_resolution(message)
+            return
+
         if event_type == "price_change":
             self.apply_price_change(message)
             return
