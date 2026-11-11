@@ -48,6 +48,25 @@ class Market:
     neg_risk: bool = False
 
 
+@dataclass(frozen=True)
+class OfficialResolution:
+    """Structured official-resolution result.
+
+    ``winner`` is None whenever the market is not safely resolved.  ``status``
+    always carries a machine-readable reason instead of collapsing every
+    failure into ``None``.
+    """
+
+    winner: str | None
+    status: str
+    detail: str = ""
+    http_code: int | None = None
+
+    @property
+    def resolved(self) -> bool:
+        return self.winner in {"UP", "DOWN"}
+
+
 @dataclass
 class Tick:
     token_id: str
@@ -1212,50 +1231,159 @@ class MarketDiscovery:
             return "DOWN"
         return None
 
-    def resolve_official(self, market_slug: str) -> str | None:
-        """Return winner only when Gamma has final ``1/0`` outcomePrices.
+    def resolve_official(self, market_slug: str) -> OfficialResolution:
+        """Resolve the official winner with an explicit status.
 
-        This is intentionally stricter than :meth:`resolve`: explicit
-        ``winner`` fields are ignored here because the settlement cash path
-        must be backed by the terminal price pair, not by a possibly stale
-        label.  Called once per poll by the paper settlement engine.
+        Priority:
+        1. ``closed`` must not contradict the final result.
+        2. ``outcomePrices`` is accepted when one side is >= 0.98 and the
+           other is <= 0.02 (rounding noise such as 0.999/0.001 is valid).
+        3. If prices are absent/invalid, explicit ``winner`` /
+           ``resolved_outcome`` fields are used.
+        4. Every failure returns a typed status and is logged; never a bare
+           ``None``.
         """
+
+        def result(
+            winner: str | None,
+            status: str,
+            detail: str = "",
+            http_code: int | None = None,
+        ) -> OfficialResolution:
+            if status not in {"RESOLVED", "STILL_UNRESOLVED"}:
+                LOG.warning(
+                    "[ResolveOfficial] slug=%s status=%s detail=%s",
+                    market_slug,
+                    status,
+                    detail,
+                )
+            else:
+                LOG.debug(
+                    "[ResolveOfficial] slug=%s status=%s detail=%s",
+                    market_slug,
+                    status,
+                    detail,
+                )
+            return OfficialResolution(
+                winner=winner,
+                status=status,
+                detail=detail,
+                http_code=http_code,
+            )
+
         try:
             url = f"{self.gamma_url}/markets?slug={urllib.parse.quote(market_slug)}"
             payload = self._request_json(url, timeout=self.timeout)
-            if isinstance(payload, dict):
-                payload = [payload]
-            if not isinstance(payload, list) or not payload:
-                return None
-            market = payload[0]
-            if not isinstance(market, dict) or not _as_bool(market.get("closed")):
-                return None
-
-            labels = [
-                str(x).strip()
-                for x in self._json_list(market.get("outcomes") or market.get("outcomeNames"))
-            ]
-            prices = self._json_list(
-                market.get("outcomePrices") or market.get("outcome_prices")
+        except urllib.error.HTTPError as exc:
+            code = int(exc.code)
+            return result(
+                None,
+                f"HTTP_{code}",
+                f"HTTP {code} from {url}",
+                http_code=code,
             )
-            if len(labels) != 2 or len(prices) != 2:
-                return None
-            numeric: list[float] = []
-            for item in prices:
-                parsed = _parse_float(item)
-                if parsed is None:
-                    return None
-                numeric.append(parsed)
-            if not (
-                (abs(numeric[0] - 1.0) <= 1e-9 and abs(numeric[1]) <= 1e-9)
-                or (abs(numeric[1] - 1.0) <= 1e-9 and abs(numeric[0]) <= 1e-9)
-            ):
-                return None
-            index = 0 if numeric[0] > numeric[1] else 1
-            return self._side_from_outcome(labels[index])
+        except json.JSONDecodeError as exc:
+            return result(None, "JSON_PARSE_ERROR", f"{exc}")
+        except TimeoutError as exc:
+            return result(None, "TIMEOUT", f"{exc}")
+        except urllib.error.URLError as exc:
+            reason = str(getattr(exc, "reason", exc))
+            status = "TIMEOUT" if "timed out" in reason.lower() else "NETWORK_ERROR"
+            return result(None, status, reason)
         except Exception as exc:  # noqa: BLE001
-            LOG.warning("resolve_official %s failed: %s", market_slug, exc)
-            return None
+            return result(None, "REQUEST_ERROR", f"{type(exc).__name__}: {exc}")
+
+        if isinstance(payload, dict):
+            # Gamma sometimes wraps the list in an object; support both forms.
+            if isinstance(payload.get("data"), list):
+                payload = payload["data"]
+            else:
+                payload = [payload]
+        if not isinstance(payload, list) or not payload:
+            return result(None, "EMPTY_PAYLOAD", "Gamma returned no markets")
+
+        market = payload[0]
+        if not isinstance(market, dict):
+            return result(None, "INVALID_PAYLOAD", f"market is {type(market).__name__}")
+
+        closed_raw = market.get("closed")
+        if closed_raw is not None and not _as_bool(closed_raw):
+            return result(
+                None,
+                "STILL_UNRESOLVED",
+                f"closed={closed_raw!r}",
+            )
+
+        labels = [
+            str(x).strip()
+            for x in self._json_list(market.get("outcomes") or market.get("outcomeNames"))
+        ]
+        prices = self._json_list(
+            market.get("outcomePrices") or market.get("outcome_prices")
+        )
+        numeric: list[float] = []
+        for item in prices:
+            parsed = _parse_float(item)
+            if parsed is None:
+                numeric = []
+                break
+            numeric.append(parsed)
+
+        price_detail = f"outcomes={labels!r} outcomePrices={prices!r}"
+        if len(labels) == 2 and len(numeric) == 2:
+            high = max(numeric)
+            low = min(numeric)
+            if high >= 0.98 and low <= 0.02:
+                index = 0 if numeric[0] > numeric[1] else 1
+                winner = self._side_from_outcome(labels[index])
+                if winner is not None:
+                    return result(
+                        winner,
+                        "RESOLVED",
+                        f"threshold winner={winner} {price_detail}",
+                    )
+                return result(
+                    None,
+                    "UNKNOWN_WINNER_LABEL",
+                    f"price winner label={labels[index]!r} {price_detail}",
+                )
+
+        # Prices missing/invalid/non-final: explicit winner fields are the
+        # documented fallback and are often present before price arrays settle.
+        for key in (
+            "winner",
+            "resolved_outcome",
+            "resolvedOutcome",
+            "winningOutcome",
+            "winning_outcome",
+        ):
+            raw = market.get(key)
+            if raw is None or raw == "":
+                continue
+            winner = self._side_from_outcome(raw)
+            if winner is not None:
+                return result(
+                    winner,
+                    "RESOLVED",
+                    f"{key}={raw!r} {price_detail}",
+                )
+            return result(
+                None,
+                "UNKNOWN_WINNER_LABEL",
+                f"{key}={raw!r} {price_detail}",
+            )
+
+        if numeric:
+            return result(
+                None,
+                "PRICE_THRESHOLD_NOT_MET",
+                price_detail,
+            )
+        return result(
+            None,
+            "NO_FINAL_OUTCOME",
+            price_detail,
+        )
 
     def resolve(self, market_slug: str) -> str | None:
         """Return the final UP/DOWN winner, or None while not final.
