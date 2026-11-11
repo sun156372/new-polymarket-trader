@@ -257,9 +257,15 @@ class Runtime:
         # a delayed or failed lookup could settle this position with the
         # previous/next market's winner.
         try:
-            winner = await asyncio.to_thread(self.discovery.resolve_official, self.market.slug)
-            if winner in {"UP", "DOWN"}:
-                return winner, "gamma_official"
+            resolved = await asyncio.to_thread(self.discovery.resolve_official, self.market.slug)
+            if resolved.winner in {"UP", "DOWN"}:
+                return resolved.winner, "gamma_official"
+            LOG.info(
+                "[Resolve] official not final market=%s status=%s detail=%s",
+                self.market.slug,
+                resolved.status,
+                resolved.detail,
+            )
         except Exception as exc:  # noqa: BLE001
             LOG.warning(
                 "[Resolve] gamma resolve failed market=%s err=%s",
@@ -272,9 +278,15 @@ class Runtime:
     async def _resolve_winner_for_position(self, p: Position) -> tuple[str | None, str]:
         """Resolve a specific position's market from strict official Gamma data."""
         try:
-            winner = await asyncio.to_thread(self.discovery.resolve_official, p.market_slug)
-            if winner in {"UP", "DOWN"}:
-                return winner, "gamma_official"
+            resolved = await asyncio.to_thread(self.discovery.resolve_official, p.market_slug)
+            if resolved.winner in {"UP", "DOWN"}:
+                return resolved.winner, "gamma_official"
+            LOG.info(
+                "[Resolve] official not final market=%s status=%s detail=%s",
+                p.market_slug,
+                resolved.status,
+                resolved.detail,
+            )
         except Exception as exc:  # noqa: BLE001
             LOG.warning(
                 "[Resolve] official resolve failed market=%s err=%s",
