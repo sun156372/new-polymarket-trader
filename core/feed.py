@@ -7,6 +7,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -95,6 +96,12 @@ class BinanceFeed:
         self._task: asyncio.Task | None = None
         self._closed = False
 
+        # 300 one-second samples = 5 minutes of history.  Sampling at 1 Hz
+        # (rather than every bookTicker message) lets a settlement that runs
+        # 60-180s after market end still average the prices *at* the close.
+        self._price_samples: deque[tuple[int, float]] = deque(maxlen=300)
+        self._last_sample_ms: int = 0
+
         self._last_log_spot: float | None = None
         self._last_log_ts = 0.0
         self._log_interval_s = 5.0
@@ -174,6 +181,14 @@ class BinanceFeed:
         elif ask is not None:
             self._spot = ask
 
+        if self._spot is not None:
+            sample_ms = int(time.time() * 1000)
+            # One immutable sample per second.  We keep the latest price in
+            # that second; `_price_samples[-1]` is therefore the close proxy.
+            if sample_ms - self._last_sample_ms >= 1000:
+                self._last_sample_ms = sample_ms
+                self._price_samples.append((sample_ms, float(self._spot)))
+
         if self._spot is not None and self._should_log_spot(self._spot):
             LOG.info(
                 "[Binance] spot_now=%.8f bid=%.8f ask=%.8f",
@@ -191,6 +206,31 @@ class BinanceFeed:
             except asyncio.CancelledError:
                 pass
         self._task = None
+        self._price_samples.clear()
+        self._last_sample_ms = 0
+
+    def average_price(self, window_s: float = 30.0, end_ms: int | None = None) -> float | None:
+        """Average Binance bookTicker mid over the window ending at ``end_ms``.
+
+        This is the third-line local fallback, never the instantaneous spot.
+        Returns None when the ring has no sample inside the requested window.
+        """
+        samples = list(self._price_samples)
+        if not samples:
+            return None
+        try:
+            window_ms = int(max(1.0, min(float(window_s), 300.0)) * 1000)
+            anchor_ms = int(end_ms) if end_ms is not None else int(time.time() * 1000)
+        except (TypeError, ValueError):
+            return None
+        cutoff = anchor_ms - window_ms
+        values = [
+            price for ts, price in samples
+            if cutoff <= ts <= anchor_ms
+        ]
+        if not values:
+            return None
+        return float(sum(values) / len(values))
 
     def spot(self) -> float | None:
         return self._spot
@@ -1171,6 +1211,51 @@ class MarketDiscovery:
         if s in {"down", "no", "n", "0", "false", "winner_down", "winner-down"}:
             return "DOWN"
         return None
+
+    def resolve_official(self, market_slug: str) -> str | None:
+        """Return winner only when Gamma has final ``1/0`` outcomePrices.
+
+        This is intentionally stricter than :meth:`resolve`: explicit
+        ``winner`` fields are ignored here because the settlement cash path
+        must be backed by the terminal price pair, not by a possibly stale
+        label.  Called once per poll by the paper settlement engine.
+        """
+        try:
+            url = f"{self.gamma_url}/markets?slug={urllib.parse.quote(market_slug)}"
+            payload = self._request_json(url, timeout=self.timeout)
+            if isinstance(payload, dict):
+                payload = [payload]
+            if not isinstance(payload, list) or not payload:
+                return None
+            market = payload[0]
+            if not isinstance(market, dict) or not _as_bool(market.get("closed")):
+                return None
+
+            labels = [
+                str(x).strip()
+                for x in self._json_list(market.get("outcomes") or market.get("outcomeNames"))
+            ]
+            prices = self._json_list(
+                market.get("outcomePrices") or market.get("outcome_prices")
+            )
+            if len(labels) != 2 or len(prices) != 2:
+                return None
+            numeric: list[float] = []
+            for item in prices:
+                parsed = _parse_float(item)
+                if parsed is None:
+                    return None
+                numeric.append(parsed)
+            if not (
+                (abs(numeric[0] - 1.0) <= 1e-9 and abs(numeric[1]) <= 1e-9)
+                or (abs(numeric[1] - 1.0) <= 1e-9 and abs(numeric[0]) <= 1e-9)
+            ):
+                return None
+            index = 0 if numeric[0] > numeric[1] else 1
+            return self._side_from_outcome(labels[index])
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("resolve_official %s failed: %s", market_slug, exc)
+            return None
 
     def resolve(self, market_slug: str) -> str | None:
         """Return the final UP/DOWN winner, or None while not final.
