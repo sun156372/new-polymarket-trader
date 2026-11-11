@@ -80,6 +80,32 @@ class Fill:
     raw: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class SettlementResult:
+    winner: str
+    source: str
+    payout: float
+    pnl: float
+    forced_loss: bool = False
+
+
+def _settlement_side(value: object) -> str | None:
+    side = str(value or "").strip().upper()
+    if side == "YES":
+        return "UP"
+    if side == "NO":
+        return "DOWN"
+    return side if side in {"UP", "DOWN"} else None
+
+
+def _finite_price(value: object) -> float | None:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    return price if math.isfinite(price) and price > 0.0 else None
+
+
 class BaseExecutor:
     mode = "base"
 
@@ -223,6 +249,108 @@ class PaperExecutor(BaseExecutor):
         except Exception as e:  # 防弹衣：必须让调用方看到坏账，不能静默返回 0
             print(f"[Settle Error] 清理坏账: {e}", flush=True)
             raise
+
+
+    def resolve_and_settle_paper(
+        self,
+        fill: Fill,
+        *,
+        official_winner: str | None,
+        twap_open: float | None,
+        twap_close: float | None,
+        binance_twap: float | None,
+        spot_open: float | None,
+        now_ms: int,
+        end_time_ms: int,
+        fallback_after_s: float = 60.0,
+        hard_timeout_s: float = 180.0,
+    ) -> SettlementResult | None:
+        """Settle a paper position under the three-line priority ladder.
+
+        Layer 1: official Gamma ``outcomePrices == 1/0`` (already validated by
+        the caller) wins immediately.
+        Layer 2: after 60s, Chainlink RTDS TWAP close vs open.
+        Layer 3: if RTDS is unavailable, Binance 30s average vs spot_open.
+        At 180s the breaker fires even if all three are unavailable; in that
+        case the position is booked as a forced LOSS, never left open.
+
+        Returns ``None`` only while waiting before the 180s hard deadline.
+        """
+
+        winner = _settlement_side(official_winner)
+        if winner is not None:
+            return self._settle_result(fill, winner, "gamma_official", forced_loss=False)
+
+        now = int(now_ms)
+        end = int(end_time_ms)
+        fallback_at = end + int(float(fallback_after_s) * 1000)
+        hard_at = end + int(float(hard_timeout_s) * 1000)
+
+        if now < fallback_at:
+            return None
+
+        twap_open_f = _finite_price(twap_open)
+        twap_close_f = _finite_price(twap_close)
+        if twap_open_f is not None and twap_close_f is not None:
+            if twap_close_f > twap_open_f:
+                return self._settle_result(fill, "UP", "rtds_twap_fallback", forced_loss=False)
+            if twap_close_f < twap_open_f:
+                return self._settle_result(fill, "DOWN", "rtds_twap_fallback", forced_loss=False)
+
+        local_open = _finite_price(spot_open)
+        local_close = _finite_price(binance_twap)
+        if local_open is not None and local_close is not None:
+            if local_close > local_open:
+                return self._settle_result(fill, "UP", "local_binance_twap_fallback", forced_loss=False)
+            if local_close < local_open:
+                return self._settle_result(fill, "DOWN", "local_binance_twap_fallback", forced_loss=False)
+
+        if now < hard_at:
+            return None
+
+        # Terminal breaker: never loop forever and never leave a position in
+        # memory.  If no source produced a direction, force the losing side.
+        side = _settlement_side(fill.side)
+        if side is None:
+            raise ValueError(f"invalid settlement side: {fill.side!r}")
+        forced_winner = "DOWN" if side == "UP" else "UP"
+        return self._settle_result(
+            fill,
+            forced_winner,
+            "hard_timeout_force_loss",
+            forced_loss=True,
+        )
+
+    def _settle_result(
+        self,
+        fill: Fill,
+        winner: str,
+        source: str,
+        *,
+        forced_loss: bool,
+    ) -> SettlementResult:
+        side = _settlement_side(fill.side)
+        if side is None:
+            raise ValueError(f"invalid settlement side: {fill.side!r}")
+        pnl = self.settle_paper(fill, winner)
+        payout = float(fill.shares) if side == winner else 0.0
+        LOG.info(
+            "[Paper] RESOLVE %s side=%s winner=%s source=%s payout=%.4f pnl=%+.4f forced=%s",
+            fill.market_slug,
+            side,
+            winner,
+            source,
+            payout,
+            pnl,
+            forced_loss,
+        )
+        return SettlementResult(
+            winner=winner,
+            source=source,
+            payout=payout,
+            pnl=pnl,
+            forced_loss=forced_loss,
+        )
 
 
 class LiveExecutor(BaseExecutor):
