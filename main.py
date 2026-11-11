@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """V7 entrypoint: paper or live, final-240s V6 strategy, crash recovery, auto-redeem."""
 from __future__ import annotations
@@ -89,10 +88,18 @@ class Runtime:
             (_finite_float(resolution_cfg.get("poll_interval_s")) or 5.0) * 1000
         )
         self.resolution_fallback_ms = int(
-            (_finite_float(resolution_cfg.get("fallback_after_s")) or 300.0) * 1000
+            (_finite_float(resolution_cfg.get("fallback_after_s")) or 60.0) * 1000
         )
         self.resolution_hard_deadline_ms = int(
-            (_finite_float(resolution_cfg.get("hard_deadline_s")) or 900.0) * 1000
+            (
+                _finite_float(
+                    resolution_cfg.get("hard_timeout_s")
+                    if resolution_cfg.get("hard_timeout_s") is not None
+                    else resolution_cfg.get("hard_deadline_s")
+                )
+                or 180.0
+            )
+            * 1000
         )
 
         twap_cfg = cfg.get("chainlink_twap", {}) or {}
@@ -250,9 +257,9 @@ class Runtime:
         # a delayed or failed lookup could settle this position with the
         # previous/next market's winner.
         try:
-            winner = await asyncio.to_thread(self.discovery.resolve, self.market.slug)
+            winner = await asyncio.to_thread(self.discovery.resolve_official, self.market.slug)
             if winner in {"UP", "DOWN"}:
-                return winner, f"gamma:{self.market.slug}"
+                return winner, "gamma_official"
         except Exception as exc:  # noqa: BLE001
             LOG.warning(
                 "[Resolve] gamma resolve failed market=%s err=%s",
@@ -263,28 +270,18 @@ class Runtime:
         return None, "gamma-unresolved"
 
     async def _resolve_winner_for_position(self, p: Position) -> tuple[str | None, str]:
-        """Resolve a specific position's market, including recovered old markets."""
-        if self.market is not None and p.market_slug == self.market.slug:
-            # A WS resolution is only a fast path for the exact current
-            # market.  The cache lookup checks condition_id, slug and both
-            # token ids, so an unrelated market_resolved event cannot settle
-            # this position.
-            ws_winner = self._resolve_winner_from_ws_cache()
-            if ws_winner in {"UP", "DOWN"}:
-                return ws_winner, "ws_market_resolved"
-            return await self._resolve_market_winner()
-
+        """Resolve a specific position's market from strict official Gamma data."""
         try:
-            winner = await asyncio.to_thread(self.discovery.resolve, p.market_slug)
+            winner = await asyncio.to_thread(self.discovery.resolve_official, p.market_slug)
             if winner in {"UP", "DOWN"}:
-                return winner, f"gamma:{p.market_slug}"
+                return winner, "gamma_official"
         except Exception as exc:  # noqa: BLE001
             LOG.warning(
-                "[Resolve] gamma resolve failed market=%s err=%s",
+                "[Resolve] official resolve failed market=%s err=%s",
                 p.market_slug,
                 exc,
             )
-        return None, "unresolved"
+        return None, "gamma-unresolved"
 
     async def _roll_market(self, now: int) -> bool:
         slug, _ = MarketDiscovery.slug_for(now)
@@ -650,7 +647,11 @@ class Runtime:
                 self.paper_fill = fill
                 self.trade_id = trade_id
                 self.paper_settle_started_ms = now_ms()
-                self.paper_settle_deadline_ms = self.market.end_ms + 300_000 if self.market else None
+                self.paper_settle_deadline_ms = (
+                    self.market.end_ms + self.resolution_hard_deadline_ms
+                    if self.market
+                    else None
+                )
             self.analytics.note_entry()
             self.analytics.note_position_change()
             print(
@@ -677,6 +678,13 @@ class Runtime:
             return
 
     async def _settle_paper(self) -> None:
+        """Settle closed paper positions with a bounded three-line ladder.
+
+        Layer 1 is strict official Gamma; layer 2 is RTDS Chainlink TWAP at
+        +60s; layer 3 is the Binance 30s average at +60s.  At +180s the
+        terminal breaker always books the position, using the best available
+        source or a forced LOSS.  This method has no unbounded wait.
+        """
         if self.mode != "paper":
             return
 
@@ -688,216 +696,170 @@ class Runtime:
         fee_coef = float(getattr(self.executor, "fee_coefficient", 0.07))
 
         for p in active:
-            # At the exact market close, stop pretending this is an open
-            # position.  PENDING is persisted before the first API poll; the
-            # official result is the only thing allowed to book a WIN/LOSS.
             if p.status == "open" and now >= p.end_time_ms:
                 self.state.update_position(
                     p.trade_id,
                     status="PENDING",
-                    last_error="waiting-official-resolution",
-                )
-                LOG.info(
-                    "[Paper] market closed; PENDING official resolution market=%s",
-                    p.market_slug,
+                    last_error="waiting-resolution",
                 )
                 print(
                     f"[结算] 盘口 {p.market_slug} 结束 | "
-                    f"等待 Polymarket 官方结果 | status=PENDING",
+                    f"等待官方 / TWAP / 本地均价 | status=PENDING",
                     flush=True,
                 )
                 if p.trade_id == self.trade_id:
-                    # The position stays in state and is settled by the
-                    # PENDING poller; releasing the runtime fill lets the
-                    # next 5m market start without losing the position.
                     self._clear_paper_fill()
                 p.status = "PENDING"
 
-            # Legacy PENDING_RESOLUTION records from the previous patch are
-            # treated identically, but new records use PENDING.
             if p.status == "PENDING_RESOLUTION":
                 self.state.update_position(p.trade_id, status="PENDING")
                 p.status = "PENDING"
 
-            if now < p.end_time_ms + self.resolution_start_buffer_ms:
+            if now < p.end_time_ms:
                 continue
 
-            fallback_at = p.end_time_ms + self.resolution_fallback_ms
             last_attempt = p.last_attempt_ms or 0
-            winner: str | None = None
-            source = "gamma-unresolved"
+            hard_at = p.end_time_ms + self.resolution_hard_deadline_ms
+            must_poll = now - last_attempt >= self.resolution_poll_interval_ms
+            if now >= hard_at:
+                # Final official attempt at the circuit-breaker boundary even
+                # when the normal 5s poll interval has not elapsed.
+                must_poll = True
 
-            # Official result first.  Never settle from local spot inside this
-            # window: the local comparison is only an emergency fallback.
-            if now < fallback_at:
-                if now - last_attempt < self.resolution_poll_interval_ms:
-                    continue
+            official_winner: str | None = None
+            if now >= p.end_time_ms + self.resolution_start_buffer_ms and must_poll:
                 self.state.update_position(p.trade_id, last_attempt_ms=now)
-                winner, source = await self._resolve_winner_for_position(p)
-                if winner is None:
+                official_winner, _official_source = await self._resolve_winner_for_position(p)
+                if official_winner is None:
                     self.state.update_position(
                         p.trade_id,
                         status="PENDING",
-                        last_attempt_ms=now,
                         last_error="waiting-official-resolution",
                     )
-                    continue
-            else:
-                # Five-minute official timeout: one last official attempt, then
-                # the frozen local close may be used.  This branch is explicit
-                # and loudly logged; it is not the normal settlement path.
-                if now - last_attempt >= self.resolution_poll_interval_ms:
-                    self.state.update_position(p.trade_id, last_attempt_ms=now)
-                    winner, source = await self._resolve_winner_for_position(p)
-                if winner is None:
-                    local_winner, local_source = self._local_winner_for_position(p)
-                    if local_winner in {"UP", "DOWN"}:
-                        winner, source = local_winner, local_source
-                        already = str(p.last_error or "").startswith("fallback:")
-                        if not already:
-                            print(
-                                f"[警告] 官方结算超时，启用本地 Chainlink TWAP 兜底 "
-                                f"market={p.market_slug} source={source} "
-                                f"twap_open={_finite_float(p.twap_open)} "
-                                f"twap_close={_finite_float(p.twap_close)} "
-                                f"window={p.twap_window_s}s",
-                                flush=True,
-                            )
-                            LOG.warning(
-                                "[Paper] official resolution timeout; local fallback market=%s source=%s",
-                                p.market_slug,
-                                source,
-                            )
-                        self.state.update_position(
-                            p.trade_id,
-                            status="PENDING",
-                            last_error="fallback:LOCAL_FALLBACK_TIMEOUT",
-                        )
 
-            if winner is None:
-                if now >= p.end_time_ms + self.resolution_hard_deadline_ms:
-                    LOG.warning(
-                        "[Paper] winner still unresolved at hard deadline market=%s source=%s; preserving position for manual review",
-                        p.market_slug,
-                        source,
-                    )
-                    print(
-                        f"[结算] 盘口 {p.market_slug} 结束 | 无法确定赢家 | "
-                        f"来源: {source} | 持仓: {p.side} | 保留持仓等待人工处理",
-                        flush=True,
-                    )
-                    self.state.update_position(
-                        p.trade_id,
-                        status="unresolved",
-                        last_error=source,
-                    )
-                    if p.trade_id == self.trade_id:
-                        self._clear_paper_fill()
-                continue
+            twap_open = _positive_float(p.twap_open)
+            twap_close = _positive_float(p.twap_close)
+            if p.trade_id == self.trade_id:
+                twap_open = twap_open or _positive_float(self.twap_open)
+                twap_close = twap_close or _positive_float(self.twap_close)
 
-            winner = str(winner).upper()
-            try:
-                shares = float(p.shares)
-                entry = float(p.entry_price)
-                fee = shares * fee_coef * entry * (1 - entry)
-                cost = shares * entry + fee
-                side = str(p.side).strip().upper()
-                if side == "YES":
-                    side = "UP"
-                elif side == "NO":
-                    side = "DOWN"
-                if side not in {"UP", "DOWN"}:
-                    raise ValueError(f"invalid position side: {p.side!r}")
-                won = side == winner
-                payout = shares if won else 0.0
-                final_price = 1.0 if won else 0.0
+            binance_twap = self.binance.average_price(
+                30.0,
+                end_ms=p.end_time_ms,
+            )
 
-                fill_for_settle = Fill(
-                    market_slug=p.market_slug,
-                    side=p.side,
-                    token_id=p.token_id,
-                    entry_price=entry,
-                    shares=shares,
-                    stake_usdc=cost,
-                    fee_usdc=fee,
-                    order_id=p.order_id,
-                    raw={"paper": True, "resolution_source": source},
-                )
-                # The executor is the single owner of paper cash: it has
-                # already debited the entry cost and now adds the payout.
-                pnl = self.executor.settle_paper(fill_for_settle, winner)
-                if not all(math.isfinite(v) for v in (cost, payout, pnl)):
-                    raise ValueError(
-                        f"invalid settlement math: cost={cost!r} payout={payout!r} pnl={pnl!r}"
-                    )
+            shares = float(p.shares)
+            entry = float(p.entry_price)
+            fee = shares * fee_coef * entry * (1.0 - entry)
+            cost = shares * entry + fee
+            fill_for_settle = Fill(
+                market_slug=p.market_slug,
+                side=p.side,
+                token_id=p.token_id,
+                entry_price=entry,
+                shares=shares,
+                stake_usdc=cost,
+                fee_usdc=fee,
+                order_id=p.order_id,
+                raw={"paper": True},
+            )
 
-                self.analytics.record(
-                    pnl=pnl,
-                    stake=cost,
-                    won=won,
-                    market=p.market_slug,
-                    side=p.side,
-                    payout=payout,
-                    source=source,
-                )
-                held = "YES" if p.side.upper() in {"UP", "YES"} else "NO"
-                twap_detail = ""
-                if str(source).lower().startswith("local"):
-                    twap_detail = (
-                        f" twap_open={_finite_float(p.twap_open)}"
-                        f" twap_close={_finite_float(p.twap_close)}"
-                        f" twap_window={p.twap_window_s}s"
-                    )
-                print(
-                    f"[结算] 盘口 {p.market_slug} 结束 | 最终赢家: {winner} | "
-                    f"我的持仓: {held} ({p.side}) | 最终价格: {final_price:.4f} | "
-                    f"来源: {source} | 份数: {shares:.4f} | 成本: {cost:.4f} | "
-                    f"回收: {payout:.4f} | 盈亏: {pnl:+.4f} | "
-                    f"最新余额: {self.analytics.balance:.4f} | "
-                    f"executor_balance: {self.executor.balance:.4f}{twap_detail}",
-                    flush=True,
-                )
-                closed = self.state.close_trade(
-                    p.trade_id,
-                    status="WIN" if won else "LOSS",
-                    payout=payout,
-                    pnl=pnl,
-                    cost_usdc=cost,
-                    source=source,
-                    settled_at_ms=now,
-                )
-                if not closed:
-                    # Accounting already happened.  Never leave the position
-                    # open, or the next step would pay it out a second time.
-                    self.state.update_position(
-                        p.trade_id,
-                        status="unresolved",
-                        last_error="settlement accounting done but history/position missing",
-                    )
-                    LOG.warning(
-                        "[Paper] settlement accounting done but history/position missing trade_id=%s",
-                        p.trade_id,
-                    )
-                LOG.info(
-                    "[Paper] settled market=%s side=%s winner=%s source=%s payout=%.4f pnl=%+.4f cost=%.4f closed=%s",
-                    p.market_slug,
-                    p.side,
-                    winner,
-                    source,
-                    payout,
-                    pnl,
-                    cost,
-                    closed,
-                )
-            except Exception as e:
-                print(f"[Settle Error] 清理坏账: {e}", flush=True)
+            result = self.executor.resolve_and_settle_paper(
+                fill_for_settle,
+                official_winner=official_winner,
+                twap_open=twap_open,
+                twap_close=twap_close,
+                binance_twap=binance_twap,
+                spot_open=_positive_float(p.spot_open),
+                now_ms=now,
+                end_time_ms=p.end_time_ms,
+                fallback_after_s=self.resolution_fallback_ms / 1000.0,
+                hard_timeout_s=self.resolution_hard_deadline_ms / 1000.0,
+            )
+            if result is None:
                 self.state.update_position(
                     p.trade_id,
-                    status="unresolved",
-                    last_error=f"settle: {type(e).__name__}: {e}",
+                    status="PENDING",
+                    last_error="waiting-resolution",
                 )
-                if p.trade_id == self.trade_id:
-                    self._clear_paper_fill()
+                continue
+
+            winner = str(result.winner).upper()
+            source = str(result.source)
+            payout = float(result.payout)
+            pnl = float(result.pnl)
+            held = "YES" if p.side.upper() in {"UP", "YES"} else "NO"
+            final_price = 1.0 if payout > 0 else 0.0
+            detail = ""
+            if source in {"rtds_twap_fallback", "local_binance_twap_fallback"}:
+                detail = (
+                    f" twap_open={_finite_float(twap_open)}"
+                    f" twap_close={_finite_float(twap_close)}"
+                    f" binance_twap={_finite_float(binance_twap)}"
+                    f" spot_open={_finite_float(p.spot_open)}"
+                )
+
+            if result.forced_loss:
+                print(
+                    f"[WARNING] 强制超时熔断平仓 market={p.market_slug} "
+                    f"elapsed={now - p.end_time_ms}ms "
+                    f"twap_open={_finite_float(twap_open)} "
+                    f"twap_close={_finite_float(twap_close)} "
+                    f"binance_twap={_finite_float(binance_twap)}",
+                    flush=True,
+                )
+
+            self.analytics.record(
+                pnl=pnl,
+                stake=cost,
+                won=payout > 0,
+                market=p.market_slug,
+                side=p.side,
+                payout=payout,
+                source=source,
+            )
+            print(
+                f"[结算] 盘口 {p.market_slug} 结束 | 最终赢家: {winner} | "
+                f"我的持仓: {held} ({p.side}) | 最终价格: {final_price:.4f} | "
+                f"来源: {source} | 份数: {shares:.4f} | 成本: {cost:.4f} | "
+                f"回收: {payout:.4f} | 盈亏: {pnl:+.4f} | "
+                f"最新余额: {self.analytics.balance:.4f} | "
+                f"executor_balance: {self.executor.balance:.4f}{detail}",
+                flush=True,
+            )
+            closed = self.state.close_trade(
+                p.trade_id,
+                status="WIN" if payout > 0 else "LOSS",
+                payout=payout,
+                pnl=pnl,
+                cost_usdc=cost,
+                source=source,
+                settled_at_ms=now,
+            )
+            if not closed:
+                # Never leave a paid-out position in memory.  The forced
+                # breaker path must clear it even if history reconstruction
+                # failed.
+                self.state.remove_position(p.trade_id)
+                LOG.warning(
+                    "[Paper] close_trade failed; removed position trade_id=%s source=%s",
+                    p.trade_id,
+                    source,
+                )
+
+            LOG.info(
+                "[Paper] settled market=%s side=%s winner=%s source=%s payout=%.4f "
+                "pnl=%+.4f cost=%.4f forced=%s closed=%s",
+                p.market_slug,
+                p.side,
+                winner,
+                source,
+                payout,
+                pnl,
+                cost,
+                result.forced_loss,
+                closed,
+            )
         if self.paper_fill is not None and self.trade_id:
             positions = {p.trade_id: p for p in self.state.active_positions()}
             pos = positions.get(self.trade_id)
