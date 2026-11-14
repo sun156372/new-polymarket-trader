@@ -104,7 +104,7 @@ class Runtime:
         twap_cfg = cfg.get("chainlink_twap", {}) or {}
         self.twap_enabled = bool(twap_cfg.get("enabled", True))
         self.twap = ChainlinkTwapFeed(
-            twap_cfg.get("ws_url", "wss://ws-live-data.polymarket.com"),
+            twap_cfg.get("ws_url", "wss://ws-live-v2.polymarket.com/ws"),
             topic=twap_cfg.get("topic", "price.crypto.twap"),
             symbol=twap_cfg.get("symbol", "btcusd"),
             window_seconds=int(_finite_float(twap_cfg.get("window_seconds")) or 30),
@@ -115,6 +115,8 @@ class Runtime:
             close_tolerance_ms=int(
                 (float(_finite_float(twap_cfg.get("close_tolerance_s")) or 45.0)) * 1000
             ),
+            rest_url=twap_cfg.get("rest_url", "") or None,
+            rest_timeout_s=float(_finite_float(twap_cfg.get("rest_timeout_s")) or 8.0),
         )
 
         self.state = StateManager(
@@ -180,6 +182,9 @@ class Runtime:
         self._last_strategy_log_ms: int = 0
         self._last_strategy_skip_log_ms: int = 0
         self._last_strategy_none_log_ms: int = 0
+        self._twap_rest_open_attempted = False
+        self._twap_rest_close_attempted = False
+        self._twap_rest_tasks: set[asyncio.Task] = set()
         self.stop = asyncio.Event()
         self._startup_health_panel_printed = False
 
@@ -314,6 +319,8 @@ class Runtime:
         self.twap_open_ts_ms = None
         self.twap_close_ts_ms = None
         self.twap_window_s = None
+        self._twap_rest_open_attempted = False
+        self._twap_rest_close_attempted = False
         self.move_distance = None
         self.spot_move = None
         self.imbalance = None
@@ -364,8 +371,9 @@ class Runtime:
                 self.twap_window_s,
             )
         else:
+            self._schedule_rest_twap("open")
             LOG.warning(
-                "[MarketOpen] no Chainlink TWAP near start market=%s; local fallback will remain unavailable",
+                "[MarketOpen] no Chainlink TWAP near start market=%s; trying REST fallback/keeping local fallback unavailable",
                 self.market.slug,
             )
 
@@ -445,6 +453,82 @@ class Runtime:
                 self.spot_open,
             )
 
+    def _schedule_rest_twap(self, phase: str) -> None:
+        """Best-effort one-shot REST TWAP fetch when the WS is unavailable.
+
+        The endpoint is deliberately configurable: Polymarket does not publish
+        an unauthenticated REST twin of PolyBolt.  If ``rest_url`` is blank, do
+        nothing and let the position remain PENDING rather than fabricating a
+        settlement price.
+        """
+        if not self.twap.rest_url:
+            return
+        if phase == "open" and self._twap_rest_open_attempted:
+            return
+        if phase == "close" and self._twap_rest_close_attempted:
+            return
+        if phase == "open":
+            self._twap_rest_open_attempted = True
+        elif phase == "close":
+            self._twap_rest_close_attempted = True
+        else:
+            return
+        task = asyncio.create_task(
+            self._fetch_rest_twap(phase), name=f"twap-rest-{phase}"
+        )
+        self._twap_rest_tasks.add(task)
+        task.add_done_callback(self._twap_rest_tasks.discard)
+
+    async def _fetch_rest_twap(self, phase: str) -> None:
+        market = self.market
+        if market is None:
+            return
+        tick = await self.twap.fetch_rest_tick()
+        if tick is None:
+            return
+        if self.market is not market:
+            return
+        if phase == "open":
+            tolerance = self.twap.open_tolerance_ms
+            target = market.start_ms
+        else:
+            tolerance = self.twap.close_tolerance_ms
+            target = market.end_ms
+        if abs(int(tick.timestamp_ms) - int(target)) > tolerance:
+            LOG.warning(
+                "[TWAP] REST tick outside %s boundary market=%s delta_ms=%d tolerance=%d",
+                phase,
+                market.slug,
+                int(tick.timestamp_ms) - int(target),
+                tolerance,
+            )
+            return
+        fields = {
+            "twap_open" if phase == "open" else "twap_close": float(tick.value),
+            "twap_open_ts_ms" if phase == "open" else "twap_close_ts_ms": int(
+                tick.timestamp_ms
+            ),
+            "twap_window_s": int(tick.window_seconds),
+            "twap_source": "chainlink-rest",
+        }
+        if phase == "open":
+            self.twap_open = float(tick.value)
+            self.twap_open_ts_ms = int(tick.timestamp_ms)
+        else:
+            self.twap_close = float(tick.value)
+            self.twap_close_ts_ms = int(tick.timestamp_ms)
+        self.twap_window_s = int(tick.window_seconds)
+        if phase == "close" and self.trade_id:
+            self.state.update_position(self.trade_id, **fields)
+        LOG.info(
+            "[TWAP] REST %s accepted market=%s value=%.4f ts=%s window=%ss",
+            phase,
+            market.slug,
+            tick.value,
+            tick.timestamp_ms,
+            tick.window_seconds,
+        )
+
     def _update_indicators(self, now: int) -> None:
         """Refresh mid/move/imbalance every step, not only at T-240."""
         if self.market is None:
@@ -521,8 +605,9 @@ class Runtime:
                     self.twap_window_s,
                 )
             else:
+                self._schedule_rest_twap("close")
                 LOG.warning(
-                    "[MarketClose] no Chainlink TWAP near close market=%s; fallback unavailable",
+                    "[MarketClose] no Chainlink TWAP near close market=%s; trying REST fallback",
                     self.market.slug,
                 )
 
