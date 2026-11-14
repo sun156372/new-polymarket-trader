@@ -106,7 +106,7 @@ class Runtime:
         self.twap_enabled = bool(twap_cfg.get("enabled", True))
         self.twap = ChainlinkTwapFeed(
             twap_cfg.get("ws_url", "wss://ws-live-data.polymarket.com"),
-            topic=twap_cfg.get("topic", "prices.crypto.chainlink.twap"),
+            topic=twap_cfg.get("topic", "price.crypto.twap"),
             symbol=twap_cfg.get("symbol", "btc/usd"),
             window_seconds=int(_finite_float(twap_cfg.get("window_seconds")) or 30),
             stale_after_s=float(_finite_float(twap_cfg.get("stale_after_s")) or 120.0),
