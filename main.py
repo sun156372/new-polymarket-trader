@@ -75,7 +75,6 @@ class Runtime:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.params = V6Params.from_config(cfg)
-        print(f"Loaded force_trade_test={self.params.force_trade_test}", flush=True)
         print(f"Loaded strategy params={cfg.get('strategy', {})}", flush=True)
         self.strategy = V6Strategy(self.params)
         self.mode = str(cfg.get("mode", "paper")).lower()
@@ -107,7 +106,7 @@ class Runtime:
         self.twap = ChainlinkTwapFeed(
             twap_cfg.get("ws_url", "wss://ws-live-data.polymarket.com"),
             topic=twap_cfg.get("topic", "price.crypto.twap"),
-            symbol=twap_cfg.get("symbol", "btc/usd"),
+            symbol=twap_cfg.get("symbol", "btcusd"),
             window_seconds=int(_finite_float(twap_cfg.get("window_seconds")) or 30),
             stale_after_s=float(_finite_float(twap_cfg.get("stale_after_s")) or 120.0),
             open_tolerance_ms=int(
@@ -1093,7 +1092,6 @@ class Runtime:
 
         runtime = Runtime(cfg)
         params = runtime.params
-        print(f"Loaded force_trade_test={params.force_trade_test}", flush=True)
         print(f"Loaded full config strategy={cfg.get('strategy', {})}", flush=True)
 
         runtime.state.recover()
