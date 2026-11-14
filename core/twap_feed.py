@@ -107,7 +107,6 @@ class ChainlinkTwapFeed:
         self._last_error = ""
         self._last_msg_ms = 0
         self._accepted = 0
-        self._connect_backoff_s = 1.0
 
     # ------------------------------------------------------------------ public
     @property
@@ -160,7 +159,6 @@ class ChainlinkTwapFeed:
         if self._task is not None and not self._task.done():
             return
         self._stop.clear()
-        self._connect_backoff_s = 1.0
         self._task = asyncio.create_task(self._run(), name="chainlink-twap-feed")
 
     async def stop(self) -> None:
@@ -192,16 +190,6 @@ class ChainlinkTwapFeed:
         payloads.append({"action": "subscribe", "subscriptions": [filtered_json]})
         return payloads
 
-    async def _send_subscriptions(self, ws: Any, payloads: list[dict[str, Any]]) -> None:
-        for index, payload in enumerate(payloads, start=1):
-            await ws.send(json.dumps(payload))
-            LOG.info(
-                "[TWAP] sent subscription %d/%d topic=%s",
-                index,
-                len(payloads),
-                self.topic,
-            )
-
     async def _run(self) -> None:
         backoff_s = 1.0
         while not self._stop.is_set():
@@ -212,16 +200,12 @@ class ChainlinkTwapFeed:
                 raise
             except Exception as exc:  # noqa: BLE001
                 self._last_error = f"{type(exc).__name__}: {exc}"
-                LOG.warning(
-                    "[TWAP] connection lost: %s; retrying in %.1fs",
-                    self._last_error,
-                    backoff_s,
-                )
+                LOG.warning("[TWAP] connection lost: %s", self._last_error)
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=backoff_s)
                 except asyncio.TimeoutError:
                     pass
-                backoff_s = min(30.0, max(1.0, backoff_s * 2.0))
+                backoff_s = min(60.0, backoff_s * 2.0)
             finally:
                 self._connected = False
 
@@ -237,12 +221,15 @@ class ChainlinkTwapFeed:
         ) as ws:
             self._connected = True
             self._last_error = ""
-            self._connect_backoff_s = 1.0
+            print("[TWAP DEBUG] WebSocket connected!")
             LOG.info("[TWAP] connected to %s topic=%s", self.ws_url, self.topic)
             payloads = self._subscription_payloads()
-            await self._send_subscriptions(ws, [payloads[0]])
+            sent = 0
+            await ws.send(json.dumps(payloads[0]))
+            print(f"[TWAP DEBUG] Sent payload: {payloads[0]}")
             sent = 1
             last_switch_ms = _now_ms()
+            raw_debug_count = 0
             while not self._stop.is_set():
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
@@ -250,7 +237,8 @@ class ChainlinkTwapFeed:
                     # No messages at all, or only non-BTC messages: try the
                     # next documented subscription variant.
                     if sent < len(payloads) and self._accepted == 0:
-                        await self._send_subscriptions(ws, [payloads[sent]])
+                        await ws.send(json.dumps(payloads[sent]))
+                        print(f"[TWAP DEBUG] Sent payload: {payloads[sent]}")
                         sent += 1
                         last_switch_ms = _now_ms()
                         LOG.warning(
@@ -260,6 +248,9 @@ class ChainlinkTwapFeed:
                         )
                     continue
                 self._last_msg_ms = _now_ms()
+                if raw_debug_count < 20:
+                    print(f"[TWAP RAW] {raw}")
+                    raw_debug_count += 1
                 accepted = self.ingest(raw)
                 if accepted:
                     LOG.info(
@@ -270,7 +261,8 @@ class ChainlinkTwapFeed:
                         self._latest.window_seconds if self._latest else "?",
                     )
                 if sent < len(payloads) and self._accepted == 0 and _now_ms() - last_switch_ms > 10_000:
-                    await self._send_subscriptions(ws, [payloads[sent]])
+                    await ws.send(json.dumps(payloads[sent]))
+                    print(f"[TWAP DEBUG] Sent payload: {payloads[sent]}")
                     sent += 1
                     last_switch_ms = _now_ms()
 
