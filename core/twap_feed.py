@@ -35,9 +35,10 @@ LOG = logging.getLogger("v7.twap")
 
 DEFAULT_WS_URL = "wss://ws-live-data.polymarket.com"
 DEFAULT_TOPIC = "price.crypto.twap"
-DEFAULT_SYMBOL = "btc/usd"
+DEFAULT_SYMBOL = "btcusd"
 DEFAULT_WINDOW_SECONDS = 30
 _LEGACY_TWAP_TOPICS = {
+    "prices.crypto.twap",
     "prices.crypto.chainlink.twap",
     "price.crypto.chainlink.twap",
 }
@@ -68,7 +69,22 @@ def _to_ms(value: Any) -> int | None:
 
 
 def _normalise_symbol(value: Any) -> str:
-    return str(value or "").strip().lower().replace("-", "/").replace("_", "/")
+    """Canonical PolyBolt crypto symbol: ``btcusd``.
+
+    The server accepts canonical USD pairs without separators.  Accept the
+    common display forms (``BTC/USD``, ``BTC-USD``) on incoming messages so a
+    server-side spelling change cannot silently discard every tick, but always
+    subscribe with the canonical no-separator form.
+    """
+    return (
+        str(value or "")
+        .strip()
+        .lower()
+        .replace("/", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+    )
 
 
 @dataclass(frozen=True)
@@ -190,9 +206,13 @@ class ChainlinkTwapFeed:
         not send speculative variants, because a malformed frame can make the
         server close the socket and trigger reconnects.
         """
-        channel = self.topic
+        channel = str(self.topic).strip()
         if channel in _LEGACY_TWAP_TOPICS:
             channel = "price.crypto.twap"
+        # The wire protocol uses the singular ``price.*`` channel names even
+        # though the SDK exposes ``prices.*`` topic aliases.
+        if channel.startswith("prices."):
+            channel = "price." + channel[len("prices.") :]
         return [
             {
                 "op": "subscribe",
@@ -263,10 +283,33 @@ class ChainlinkTwapFeed:
             print("[TWAP DEBUG] WebSocket connected!")
             LOG.info("[TWAP] connected to %s channel=%s", self.ws_url, self.topic)
             await self._send_subscription(ws)
+            subscribed_ms = _now_ms()
+            connection_accepted = 0
+            warned_no_data = False
             raw_debug_count = 0
             while not self._stop.is_set():
+                # Warn even if the server sends non-TWAP heartbeats: the
+                # condition is zero accepted ticks, not zero raw messages.
+                if (
+                    not warned_no_data
+                    and connection_accepted == 0
+                    and _now_ms() - subscribed_ms >= 10_000
+                ):
+                    warned_no_data = True
+                    print(
+                        "[TWAP WARNING] 10s 未收到 TWAP 数据 "
+                        f"url={self.ws_url} channel={self.topic} "
+                        f"symbol={self.symbol!r} window={self.window_seconds}s; "
+                        "检查 channel/symbol/auth（PolyBolt 需要 CLOB API 凭证）",
+                        flush=True,
+                    )
+                    LOG.warning(
+                        "[TWAP] no data 10s after subscribe channel=%s symbol=%s",
+                        self.topic,
+                        self.symbol,
+                    )
                 try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
+                    raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
                 except asyncio.TimeoutError:
                     # Keep the socket open; a quiet TWAP channel is normal.
                     continue
@@ -285,6 +328,7 @@ class ChainlinkTwapFeed:
                     return
                 accepted = self.ingest(raw)
                 if accepted:
+                    connection_accepted += accepted
                     LOG.info(
                         "[TWAP] accepted=%d latest=%.4f ts=%s window=%ss",
                         accepted,
