@@ -5,7 +5,7 @@ The official BTC 5-minute markets settle against Chainlink's BTC/USD TWAP,
 not against Binance's instantaneous last price.  Polymarket publishes the
 same TWAP on its realtime-data WebSocket:
 
-    wss://ws-live-data.polymarket.com
+    wss://ws-live-v2.polymarket.com/ws
     channel: price.crypto.twap
 
 PolyBolt (the successor to the old RTDS price topics) uses the ``op`` /
@@ -21,6 +21,10 @@ import asyncio
 import json
 import logging
 import math
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -33,15 +37,40 @@ except Exception:  # pragma: no cover - only hit when the dependency is absent
 
 LOG = logging.getLogger("v7.twap")
 
-DEFAULT_WS_URL = "wss://ws-live-data.polymarket.com"
+# PolyBolt is the current official reference-price socket.  The old
+# ``ws-live-data`` RTDS endpoint and ``prices.*`` topics are retired.
+DEFAULT_WS_URL = "wss://ws-live-v2.polymarket.com/ws"
 DEFAULT_TOPIC = "price.crypto.twap"
 DEFAULT_SYMBOL = "btcusd"
 DEFAULT_WINDOW_SECONDS = 30
+DEFAULT_REST_URL = ""
 _LEGACY_TWAP_TOPICS = {
     "prices.crypto.twap",
     "prices.crypto.chainlink.twap",
     "price.crypto.chainlink.twap",
 }
+
+# CLOB L2 credential environment variables.  PolyBolt requires the same
+# key/secret/passphrase used by the authenticated CLOB REST API.  Accept the
+# common aliases so an existing Polymarket bot can reuse its .env unchanged.
+_AUTH_ENV_NAMES = {
+    "api_key": ("POLYMARKET_CLOB_API_KEY", "POLYMARKET_API_KEY", "CLOB_API_KEY"),
+    "secret": ("POLYMARKET_CLOB_API_SECRET", "POLYMARKET_API_SECRET", "CLOB_API_SECRET"),
+    "passphrase": (
+        "POLYMARKET_CLOB_API_PASSPHRASE",
+        "POLYMARKET_API_PASSPHRASE",
+        "CLOB_API_PASSPHRASE",
+    ),
+    "access_token": ("POLYMARKET_CLOB_ACCESS_TOKEN", "POLYMARKET_ACCESS_TOKEN"),
+}
+
+
+def _env_first(names: tuple[str, ...]) -> str:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _now_ms() -> int:
@@ -112,6 +141,13 @@ class ChainlinkTwapFeed:
         open_tolerance_ms: int = 60_000,
         close_tolerance_ms: int = 45_000,
         max_ticks: int = 4096,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+        passphrase: str | None = None,
+        access_token: str | None = None,
+        rest_url: str | None = None,
+        rest_api_key: str | None = None,
+        rest_timeout_s: float = 8.0,
     ) -> None:
         self.ws_url = str(ws_url)
         self.topic = str(topic)
@@ -128,6 +164,40 @@ class ChainlinkTwapFeed:
         self._last_error = ""
         self._last_msg_ms = 0
         self._accepted = 0
+
+        # Auth is a frame, not a URL query parameter.  Values can be passed by
+        # main.py (config/env) or read directly from the standard CLOB names.
+        self._auth: dict[str, str] = {}
+        api_key = (api_key or _env_first(_AUTH_ENV_NAMES["api_key"])).strip()
+        api_secret = (api_secret or _env_first(_AUTH_ENV_NAMES["secret"])).strip()
+        passphrase = (passphrase or _env_first(_AUTH_ENV_NAMES["passphrase"])).strip()
+        access_token = (
+            access_token or _env_first(_AUTH_ENV_NAMES["access_token"])
+        ).strip()
+        if api_key and api_secret and passphrase:
+            self._auth = {
+                "apiKey": api_key,
+                "secret": api_secret,
+                "passphrase": passphrase,
+            }
+            if access_token:
+                self._auth["accessToken"] = access_token
+        elif access_token:
+            # Some deployments issue only a bearer token.  Keep it supported
+            # without pretending a partial key/secret pair is valid.
+            self._auth = {"accessToken": access_token}
+
+        self.rest_url = (
+            rest_url
+            if rest_url is not None and str(rest_url).strip()
+            else os.getenv("POLYMARKET_TWAP_REST_URL", "")
+        ).strip()
+        self.rest_api_key = (
+            rest_api_key or _env_first(("POLYMARKET_TWAP_REST_KEY",))
+        ).strip()
+        self.rest_timeout_s = max(1.0, float(rest_timeout_s))
+        self._rest_last_error = ""
+        self._last_rest_ms = 0
 
     # ------------------------------------------------------------------ public
     @property
@@ -167,10 +237,93 @@ class ChainlinkTwapFeed:
             "buffered": len(self._ticks),
             "last_msg_ms": self._last_msg_ms,
             "last_error": self._last_error,
+            "auth_configured": bool(self._auth),
+            "rest_configured": bool(self.rest_url),
+            "last_rest_ms": self._last_rest_ms,
+            "last_rest_error": self._rest_last_error,
             "latest_value": latest.value if latest else None,
             "latest_timestamp_ms": latest.timestamp_ms if latest else None,
             "latest_window_seconds": latest.window_seconds if latest else None,
         }
+
+    async def fetch_rest_tick(self) -> TwapTick | None:
+        """One-shot REST fallback for environments where the WS is blocked.
+
+        Polymarket does not publish an unauthenticated public TWAP REST
+        endpoint.  Set ``POLYMARKET_TWAP_REST_URL`` (``chainlink_twap.rest_url``)
+        to a provider/Chainlink-gateway URL that returns JSON containing
+        ``symbol``, ``value``/``full_accuracy_value`` and ``timestamp``.  The
+        URL may contain ``{symbol}`` and ``{window_seconds}`` placeholders.
+        If no URL is configured, this returns None instead of inventing a
+        Binance substitute.
+        """
+        url = (self.rest_url or os.getenv("POLYMARKET_TWAP_REST_URL", "")).strip()
+        if not url:
+            return None
+        try:
+            url = url.format(symbol=self.symbol, window_seconds=self.window_seconds)
+        except (KeyError, ValueError):
+            self._rest_last_error = "invalid REST URL template"
+            LOG.warning("[TWAP] REST fallback skipped: %s", self._rest_last_error)
+            return None
+
+        headers = {"Accept": "application/json", "User-Agent": "polymarket-v7/1.0"}
+        if self.rest_api_key:
+            headers["Authorization"] = f"Bearer {self.rest_api_key}"
+
+        def _get() -> Any:
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=self.rest_timeout_s) as resp:
+                body = resp.read(2 * 1024 * 1024)
+            return json.loads(body.decode("utf-8", errors="replace"))
+
+        try:
+            payload = await asyncio.to_thread(_get)
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+            self._rest_last_error = f"{type(exc).__name__}: {exc}"
+            LOG.warning("[TWAP] REST fallback failed url=%s: %s", url, self._rest_last_error)
+            return None
+
+        tick = self._find_tick_in_payload(payload, require_symbol=False)
+        if tick is None:
+            self._rest_last_error = "REST response contained no BTC TWAP tick"
+            LOG.warning("[TWAP] REST fallback response unusable url=%s", url)
+            return None
+        self._last_rest_ms = _now_ms()
+        self._rest_last_error = ""
+        self._accept(tick)
+        LOG.info(
+            "[TWAP] REST fallback accepted value=%.4f ts=%s window=%ss",
+            tick.value,
+            tick.timestamp_ms,
+            tick.window_seconds,
+        )
+        return tick
+
+    def _find_tick_in_payload(
+        self, payload: Any, *, require_symbol: bool = True
+    ) -> TwapTick | None:
+        stack: list[Any] = [payload]
+        seen: set[int] = set()
+        while stack:
+            node = stack.pop()
+            node_id = id(node)
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            if isinstance(node, list):
+                stack.extend(node)
+                continue
+            if not isinstance(node, dict):
+                continue
+            tick = self._parse_tick(node, require_symbol=require_symbol, accept=False)
+            if tick is not None:
+                return tick
+            for key in ("payload", "data", "message", "messages", "result", "results"):
+                child = node.get(key)
+                if isinstance(child, (dict, list)):
+                    stack.append(child)
+        return None
 
     async def start(self) -> None:
         if websockets is None:
@@ -228,8 +381,29 @@ class ChainlinkTwapFeed:
             }
         ]
 
+    def _auth_frame(self) -> dict[str, Any] | None:
+        """Official CLOB-credential authentication frame for PolyBolt.
+
+        PolyBolt reference-price channels are authenticated.  The credentials
+        are the same L2 CLOB key/secret/passphrase used by the REST API; they
+        belong in the first frame after connecting, never in the URL.
+        """
+        if not self._auth:
+            return None
+        return {"op": "auth", "auth": dict(self._auth)}
+
     async def _send_subscription(self, ws: Any) -> None:
-        """Send the one canonical subscription frame."""
+        """Authenticate (if configured), then send the one canonical frame."""
+        auth_frame = self._auth_frame()
+        if auth_frame is not None:
+            await ws.send(json.dumps(auth_frame, separators=(",", ":")))
+            print(
+                "[TWAP DEBUG] Sent auth frame "
+                f"(apiKey={self._auth.get('apiKey', '')[:6]}...)"
+            )
+            # Ordering on a WebSocket is guaranteed; this tiny yield only lets
+            # the server's auth acknowledgement arrive before the subscription.
+            await asyncio.sleep(0.25)
         payload = self._subscription_payloads()[0]
         await ws.send(json.dumps(payload, separators=(",", ":")))
         print(f"[TWAP DEBUG] Sent payload: {payload}")
@@ -369,10 +543,21 @@ class ChainlinkTwapFeed:
                     stack.append(child)
         return accepted
 
-    def _parse_tick(self, node: dict[str, Any]) -> TwapTick | None:
+    def _parse_tick(
+        self,
+        node: dict[str, Any],
+        *,
+        require_symbol: bool = True,
+        accept: bool = True,
+    ) -> TwapTick | None:
         symbol = node.get("symbol") or node.get("pair") or node.get("asset")
-        if not symbol or _normalise_symbol(symbol) != self.symbol:
+        if symbol:
+            if _normalise_symbol(symbol) != self.symbol:
+                return None
+        elif require_symbol:
             return None
+        else:
+            symbol = self.symbol
 
         window_raw = node.get("window_seconds", node.get("windowSeconds", node.get("window")))
         if window_raw is not None:
@@ -409,7 +594,8 @@ class ChainlinkTwapFeed:
             received_ms=_now_ms(),
             full_accuracy_value=str(full_accuracy) if full_accuracy is not None else None,
         )
-        self._accept(tick)
+        if accept:
+            self._accept(tick)
         return tick
 
     @staticmethod
