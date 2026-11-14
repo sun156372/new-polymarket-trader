@@ -135,8 +135,12 @@ class PaperExecutor(BaseExecutor):
 
         # Preserve the USDC cash budget: quantity is based on the *top effective*
         # price (best ask + slippage), then the fill walks the real ask ladder.
+        # The total price impact is capped at the configured slippage: a ladder
+        # with too little depth must be rejected, not filled at any price.
         top_effective = min(0.999, levels[0][0] + self.slippage)
-        requested_shares = stake / top_effective
+        max_fill_price = min(0.999, levels[0][0] + self.slippage)
+        top_unit_cost = top_effective * (1.0 + self.fee_coefficient * (1.0 - top_effective))
+        requested_shares = stake / top_unit_cost
         if requested_shares < 1.0:
             if stake >= ask:
                 requested_shares = 1.0
@@ -145,7 +149,7 @@ class PaperExecutor(BaseExecutor):
                 raise RuntimeError("paper order size below minimum trade unit")
 
         remaining = requested_shares
-        cash_left = self.balance
+        cash_left = min(self.balance, stake)
         fills: list[tuple[float, float, float]] = []  # (effective_price, shares, unit_cost)
         for raw_price, level_size in levels:
             if remaining <= 1e-9:
@@ -186,6 +190,12 @@ class PaperExecutor(BaseExecutor):
             raise RuntimeError("paper order size zero")
         if not math.isfinite(fill_price) or fill_price <= 0:
             raise ValueError(f"invalid fill entry price: {fill_price!r}")
+        if fill_price > max_fill_price + 1e-9:
+            raise RuntimeError(
+                "paper order rejected: total slippage exceeds cap "
+                f"best_ask={levels[0][0]:.4f} fill={fill_price:.4f} "
+                f"max={max_fill_price:.4f}"
+            )
         if cost > self.balance + 1e-9:
             raise RuntimeError(
                 f"paper order rejected: cost {cost:.6f} exceeds balance {self.balance:.6f}"
