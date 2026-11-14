@@ -42,8 +42,11 @@ LOG = logging.getLogger("v7.twap")
 DEFAULT_WS_URL = "wss://ws-live-v2.polymarket.com/ws"
 DEFAULT_TOPIC = "price.crypto.twap"
 DEFAULT_SYMBOL = "btcusd"
-DEFAULT_WINDOW_SECONDS = 30
+DEFAULT_WINDOW_SECONDS = 60
 DEFAULT_REST_URL = ""
+AUTH_RID = "a1"
+SUBSCRIBE_RID = "s1"
+AUTH_ACK_TIMEOUT_S = 8.0
 _LEGACY_TWAP_TOPICS = {
     "prices.crypto.twap",
     "prices.crypto.chainlink.twap",
@@ -369,6 +372,7 @@ class ChainlinkTwapFeed:
         return [
             {
                 "op": "subscribe",
+                "rid": SUBSCRIBE_RID,
                 "subscriptions": [
                     {
                         "channel": channel,
@@ -390,20 +394,84 @@ class ChainlinkTwapFeed:
         """
         if not self._auth:
             return None
-        return {"op": "auth", "auth": dict(self._auth)}
+        return {"op": "auth", "rid": AUTH_RID, "auth": dict(self._auth)}
+
+    async def _await_auth_ack(self, ws: Any, timeout_s: float = AUTH_ACK_TIMEOUT_S) -> None:
+        """Wait for ``{"op":"authed","rid":"a1"}`` before subscribing.
+
+        Subscribing before this acknowledgement is the race that made the
+        previous client look connected while silently receiving no data.  A
+        server-side auth error is terminal; a timeout is retryable.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(1.0, float(timeout_s))
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"TWAP auth acknowledgement timeout rid={AUTH_RID} "
+                    f"after {timeout_s:.0f}s"
+                )
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    f"TWAP auth acknowledgement timeout rid={AUTH_RID} "
+                    f"after {timeout_s:.0f}s"
+                ) from exc
+
+            try:
+                msg = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+            except (TypeError, ValueError, json.JSONDecodeError):
+                print(f"[TWAP RAW] {raw}")
+                continue
+            if not isinstance(msg, dict):
+                continue
+
+            op = str(msg.get("op") or msg.get("type") or "").strip().lower()
+            rid = str(msg.get("rid") or "").strip()
+            if op == "authed" and (not rid or rid == AUTH_RID):
+                print(f"[TWAP DEBUG] Auth acknowledged rid={rid or AUTH_RID}")
+                return
+
+            err = msg.get("error") or msg.get("message")
+            if op in {"error", "auth_error", "unauthorized"} or (
+                err and op not in {"authed"}
+            ):
+                detail = json.dumps(msg, ensure_ascii=False, default=str)
+                print(f"[TWAP ERROR] auth failed: {detail}", flush=True)
+                LOG.error("[TWAP] auth failed: %s", detail)
+                self._last_error = f"auth failed: {detail}"
+                # Bad credentials will not heal on reconnect.  Stop instead
+                # of hammering PolyBolt with the same invalid key.
+                self._stop.set()
+                raise RuntimeError(f"TWAP auth failed: {detail}")
+
+            # Non-auth frames before the ack are diagnostic only; do not feed
+            # them to the strategy parser because there is no subscription yet.
+            print(f"[TWAP RAW] {raw}")
 
     async def _send_subscription(self, ws: Any) -> None:
-        """Authenticate (if configured), then send the one canonical frame."""
+        """Authenticate and wait for the ack, then subscribe.
+
+        The official sequence is mandatory:
+        ``auth(rid=a1) -> authed(rid=a1) -> subscribe(rid=s1)``.
+        """
         auth_frame = self._auth_frame()
         if auth_frame is not None:
             await ws.send(json.dumps(auth_frame, separators=(",", ":")))
             print(
                 "[TWAP DEBUG] Sent auth frame "
-                f"(apiKey={self._auth.get('apiKey', '')[:6]}...)"
+                f"(rid={AUTH_RID}, apiKey={self._auth.get('apiKey', '')[:6]}...)"
             )
-            # Ordering on a WebSocket is guaranteed; this tiny yield only lets
-            # the server's auth acknowledgement arrive before the subscription.
-            await asyncio.sleep(0.25)
+            await self._await_auth_ack(ws)
+        else:
+            print(
+                "[TWAP WARNING] CLOB credentials missing; subscribing without auth "
+                "(PolyBolt will not deliver reference-price data)"
+            )
+            LOG.warning("[TWAP] auth credentials missing; unauthenticated subscribe")
+
         payload = self._subscription_payloads()[0]
         await ws.send(json.dumps(payload, separators=(",", ":")))
         print(f"[TWAP DEBUG] Sent payload: {payload}")
@@ -447,6 +515,9 @@ class ChainlinkTwapFeed:
             raise RuntimeError("websockets dependency missing")
         async with websockets.connect(
             self.ws_url,
+            # No legacy application-level {"action":"ping"} is sent.  This is
+            # the RFC6455 transport ping owned by the websockets library; it
+            # is required to detect half-open TCP sockets.
             ping_interval=20,
             ping_timeout=20,
             close_timeout=5,
@@ -581,7 +652,14 @@ class ChainlinkTwapFeed:
             return None
 
         full_accuracy = node.get("full_accuracy_value") or node.get("fullAccuracyValue")
-        value = self._decimal_price(node.get("value"), full_accuracy)
+        if full_accuracy is not None and str(full_accuracy).strip():
+            # PolyBolt reference prices are authoritative only in
+            # full_accuracy_value (an integer scaled by 1e18).  Never fall
+            # back to the lossy float ``value`` when the full value is
+            # present but malformed.
+            value = self._decimal_price(None, full_accuracy)
+        else:
+            value = self._decimal_price(node.get("value"), None)
         if value is None:
             return None
 
