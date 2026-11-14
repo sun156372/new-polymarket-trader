@@ -1306,6 +1306,35 @@ class MarketDiscovery:
         if not isinstance(market, dict):
             return result(None, "INVALID_PAYLOAD", f"market is {type(market).__name__}")
 
+        # Explicit winner fields are the strongest signal.  Check them BEFORE
+        # `closed` and the price array: Gamma can publish the winner while
+        # `closed` or `outcomePrices` still lag, and the old strict-price
+        # parser would then fall through to local settlement.
+        for key in (
+            "winner",
+            "resolved_outcome",
+            "resolvedOutcome",
+            "winningOutcome",
+            "winning_outcome",
+            "winnerOutcome",
+            "winner_outcome",
+        ):
+            raw = market.get(key)
+            if raw is None or raw == "":
+                continue
+            winner = self._side_from_outcome(raw)
+            if winner is not None:
+                return result(
+                    winner,
+                    "RESOLVED",
+                    f"explicit {key}={raw!r}",
+                )
+            return result(
+                None,
+                "UNKNOWN_WINNER_LABEL",
+                f"{key}={raw!r}",
+            )
+
         closed_raw = market.get("closed")
         if closed_raw is not None and not _as_bool(closed_raw):
             return result(
@@ -1347,31 +1376,6 @@ class MarketDiscovery:
                     "UNKNOWN_WINNER_LABEL",
                     f"price winner label={labels[index]!r} {price_detail}",
                 )
-
-        # Prices missing/invalid/non-final: explicit winner fields are the
-        # documented fallback and are often present before price arrays settle.
-        for key in (
-            "winner",
-            "resolved_outcome",
-            "resolvedOutcome",
-            "winningOutcome",
-            "winning_outcome",
-        ):
-            raw = market.get(key)
-            if raw is None or raw == "":
-                continue
-            winner = self._side_from_outcome(raw)
-            if winner is not None:
-                return result(
-                    winner,
-                    "RESOLVED",
-                    f"{key}={raw!r} {price_detail}",
-                )
-            return result(
-                None,
-                "UNKNOWN_WINNER_LABEL",
-                f"{key}={raw!r} {price_detail}",
-            )
 
         if numeric:
             return result(
