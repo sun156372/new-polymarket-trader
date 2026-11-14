@@ -6,11 +6,12 @@ not against Binance's instantaneous last price.  Polymarket publishes the
 same TWAP on its realtime-data WebSocket:
 
     wss://ws-live-data.polymarket.com
-    topic: prices.crypto.chainlink.twap
+    channel: price.crypto.twap
 
-The subscription schema has changed a few times, so this client sends the
-documented shape first and falls back to filtered variants if no matching
-BTC tick arrives.  The parser deliberately accepts both the documented
+PolyBolt (the successor to the old RTDS price topics) uses the ``op`` /
+``channel`` / ``filter`` envelope.  In particular, the filter is a JSON
+object, not a string, and there is no top-level ``action``/``topic``/``type``
+in the subscribe frame.  The parser deliberately accepts both the documented
 payload and common wrapper variants; it never turns a non-BTC or wrong-window
 tick into a settlement price.
 """
@@ -33,9 +34,13 @@ except Exception:  # pragma: no cover - only hit when the dependency is absent
 LOG = logging.getLogger("v7.twap")
 
 DEFAULT_WS_URL = "wss://ws-live-data.polymarket.com"
-DEFAULT_TOPIC = "prices.crypto.chainlink.twap"
+DEFAULT_TOPIC = "price.crypto.twap"
 DEFAULT_SYMBOL = "btc/usd"
 DEFAULT_WINDOW_SECONDS = 30
+_LEGACY_TWAP_TOPICS = {
+    "prices.crypto.chainlink.twap",
+    "price.crypto.chainlink.twap",
+}
 
 
 def _now_ms() -> int:
@@ -174,21 +179,55 @@ class ChainlinkTwapFeed:
 
     # --------------------------------------------------------------- networking
     def _subscription_payloads(self) -> list[dict[str, Any]]:
-        sub = {"topic": self.topic, "type": "update"}
-        payloads = [{"action": "subscribe", "subscriptions": [sub]}]
-        # Older deployed RTDS builds accepted a filters string; newer ones
-        # accept an object.  Try both only after the unfiltered stream fails
-        # to produce a matching BTC tick.
-        filtered = dict(sub)
-        filtered["filters"] = {"symbol": self.symbol, "window_seconds": self.window_seconds}
-        payloads.append({"action": "subscribe", "subscriptions": [filtered]})
-        filtered_json = dict(sub)
-        filtered_json["filters"] = json.dumps(
-            {"symbol": self.symbol, "window_seconds": self.window_seconds},
-            separators=(",", ":"),
-        )
-        payloads.append({"action": "subscribe", "subscriptions": [filtered_json]})
-        return payloads
+        """Return the current PolyBolt subscription envelope.
+
+        The old RTDS shape (``action`` / ``topic`` / ``type`` / ``filters``)
+        is rejected with ``Invalid request body``.  PolyBolt uses exactly:
+
+        ``{"op":"subscribe","subscriptions":[{"channel":...,"filter":{...}}]}``
+
+        and the filter is a JSON object.  Keep one canonical frame here; do
+        not send speculative variants, because a malformed frame can make the
+        server close the socket and trigger reconnects.
+        """
+        channel = self.topic
+        if channel in _LEGACY_TWAP_TOPICS:
+            channel = "price.crypto.twap"
+        return [
+            {
+                "op": "subscribe",
+                "subscriptions": [
+                    {
+                        "channel": channel,
+                        "filter": {
+                            "symbol": self.symbol,
+                            "window_seconds": self.window_seconds,
+                        },
+                    }
+                ],
+            }
+        ]
+
+    async def _send_subscription(self, ws: Any) -> None:
+        """Send the one canonical subscription frame."""
+        payload = self._subscription_payloads()[0]
+        await ws.send(json.dumps(payload, separators=(",", ":")))
+        print(f"[TWAP DEBUG] Sent payload: {payload}")
+
+    @staticmethod
+    def _is_invalid_request_body(raw: str | bytes | dict[str, Any] | list[Any]) -> bool:
+        """Detect the server's malformed-subscription error without retrying."""
+        try:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(raw, dict):
+            return False
+        message = raw.get("message") or raw.get("error") or ""
+        return "invalid request body" in str(message).lower()
 
     async def _run(self) -> None:
         backoff_s = 1.0
@@ -222,35 +261,28 @@ class ChainlinkTwapFeed:
             self._connected = True
             self._last_error = ""
             print("[TWAP DEBUG] WebSocket connected!")
-            LOG.info("[TWAP] connected to %s topic=%s", self.ws_url, self.topic)
-            payloads = self._subscription_payloads()
-            sent = 0
-            await ws.send(json.dumps(payloads[0]))
-            print(f"[TWAP DEBUG] Sent payload: {payloads[0]}")
-            sent = 1
-            last_switch_ms = _now_ms()
+            LOG.info("[TWAP] connected to %s channel=%s", self.ws_url, self.topic)
+            await self._send_subscription(ws)
             raw_debug_count = 0
             while not self._stop.is_set():
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
                 except asyncio.TimeoutError:
-                    # No messages at all, or only non-BTC messages: try the
-                    # next documented subscription variant.
-                    if sent < len(payloads) and self._accepted == 0:
-                        await ws.send(json.dumps(payloads[sent]))
-                        print(f"[TWAP DEBUG] Sent payload: {payloads[sent]}")
-                        sent += 1
-                        last_switch_ms = _now_ms()
-                        LOG.warning(
-                            "[TWAP] no matching BTC tick yet; sent subscription variant %d/%d",
-                            sent,
-                            len(payloads),
-                        )
+                    # Keep the socket open; a quiet TWAP channel is normal.
                     continue
                 self._last_msg_ms = _now_ms()
                 if raw_debug_count < 20:
                     print(f"[TWAP RAW] {raw}")
                     raw_debug_count += 1
+                if self._is_invalid_request_body(raw):
+                    self._last_error = "subscription rejected: Invalid request body"
+                    print(
+                        "[TWAP WARNING] subscription rejected: Invalid request body; "
+                        "stopping retries. Check the channel/filter frame."
+                    )
+                    LOG.error("[TWAP] subscription rejected: Invalid request body; stopping")
+                    self._stop.set()
+                    return
                 accepted = self.ingest(raw)
                 if accepted:
                     LOG.info(
@@ -260,11 +292,6 @@ class ChainlinkTwapFeed:
                         self._latest.timestamp_ms if self._latest else "?",
                         self._latest.window_seconds if self._latest else "?",
                     )
-                if sent < len(payloads) and self._accepted == 0 and _now_ms() - last_switch_ms > 10_000:
-                    await ws.send(json.dumps(payloads[sent]))
-                    print(f"[TWAP DEBUG] Sent payload: {payloads[sent]}")
-                    sent += 1
-                    last_switch_ms = _now_ms()
 
     # ---------------------------------------------------------------- parsing
     def ingest(self, raw: str | bytes | dict[str, Any] | list[Any]) -> int:
