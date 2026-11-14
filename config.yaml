@@ -23,7 +23,9 @@ binance:
 # falling back to Binance's instantaneous price.
 chainlink_twap:
   enabled: true
-  ws_url: "wss://ws-live-data.polymarket.com"
+  # PolyBolt v2 socket. The legacy ws-live-data endpoint is public but
+  # reference-price channels now require CLOB credentials and this URL.
+  ws_url: "wss://ws-live-v2.polymarket.com/ws"
   # PolyBolt channel name. The old `prices.crypto.chainlink.twap` topic is
   # retired; the subscription frame is op/channel/filter (see twap_feed.py).
   topic: "price.crypto.twap"
@@ -33,6 +35,11 @@ chainlink_twap:
   stale_after_s: 120
   open_tolerance_s: 60
   close_tolerance_s: 45
+  # Optional one-shot REST fallback. No unauthenticated official
+  # Polymarket/Chainlink TWAP REST endpoint is published; point this at your
+  # provider (or leave blank and the position remains PENDING if WS is down).
+  rest_url: ""
+  rest_timeout_s: 8
 
 strategy:
   entry_t_minus_s: 240
