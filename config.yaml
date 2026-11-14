@@ -17,6 +17,23 @@ polymarket:
 binance:
   ws_url: "wss://stream.binance.com:9443/ws/btcusdt@bookTicker"
 
+# Official-synced local fallback source.  Polymarket's BTC 5m markets settle
+# against Chainlink's 30s BTC/USD TWAP; this RTDS topic is the same feed.
+# If no TWAP is available, the position stays PENDING/unresolved rather than
+# falling back to Binance's instantaneous price.
+chainlink_twap:
+  enabled: true
+  ws_url: "wss://ws-live-data.polymarket.com"
+  # PolyBolt channel name. The old `prices.crypto.chainlink.twap` topic is
+  # retired; the subscription frame is op/channel/filter (see twap_feed.py).
+  topic: "price.crypto.twap"
+  # PolyBolt canonical crypto symbol: USD pair without separators.
+  symbol: "btcusd"
+  window_seconds: 30
+  stale_after_s: 120
+  open_tolerance_s: 60
+  close_tolerance_s: 45
+
 strategy:
   entry_t_minus_s: 240
   move_threshold: 0.20
@@ -26,20 +43,28 @@ strategy:
   min_spot_move: 0.00020   # 2.0 bps
   max_entry_price: 0.95
   max_quote_staleness_s: 2.0
+  # Absolute dead-book gate; missing/NA/stale data never reaches an order.
+  hard_max_quote_staleness_s: 60.0
+  # Paper fills consume visible ask levels, then add this adverse slippage.
   max_slippage_cents: 2.0
 
-  # Print one detailed T-240 block per market.
+  # Print one detailed final-window block per market.
   debug: true
-
-  # DANGEROUS TEST SWITCH:
-  # True = bypass ALL thresholds at T-240 and buy the best available side.
-  # Use only to test open -> settle -> redeem -> balance, then set back to False.
-  force_trade_test: true
 
 exit:
   enable_take_profit: false
   take_profit_bid_price: 0.98
   fallback: hold_to_settlement
+
+resolution:
+  # Short grace period after close before the first strict Gamma poll.
+  start_buffer_s: 5
+  # Bounded polling; never spin the Gamma API once per main-loop tick.
+  poll_interval_s: 5
+  # Layer 2/3 fallback becomes eligible 60s after close.
+  fallback_after_s: 60
+  # Terminal breaker: always settle (or force LOSS) by 180s.
+  hard_timeout_s: 180
 
 costs:
   fee_model: "0.07 * p * (1-p)"
