@@ -1,5 +1,6 @@
+
 #!/usr/bin/env python3
-"""Pure-rule V6 strategy with continuous final-window diagnostics and force-trade test mode.
+"""Pure-rule V6 strategy with a hard data-readiness gate.
 
 Rules:
   entry anywhere in the final entry_t_minus_s seconds (default 240)
@@ -8,14 +9,8 @@ Rules:
   |spot move since the open| >= 2.0 bps
   max entry ask <= 0.95
 
-No machine learning.
-
-force_trade_test=True:
-  inside the final entry window, bypass move/imbalance/spot/max-entry and the
-  2s normal-freshness gate, but NEVER the 60s dead-book gate, and return a
-  signal for the best available side. It still requires *some* valid ask; no
-  quote means no order. This is intentionally loud and should only be used to
-  exercise open -> settle -> redeem.
+No machine learning.  There is no bypass: if any required
+spot/book field is missing, non-finite, or stale, evaluate() returns None.
 """
 from __future__ import annotations
 
@@ -35,7 +30,7 @@ BookLike = Any
 
 
 def _valid_ask(ask: float | None) -> float | None:
-    """strict validation: reject None, NaN, inf, <=0, or >1 (binary payoff)."""
+    """Strict validation: reject None, NaN, inf, <=0, or >1 (binary payoff)."""
     if ask is None:
         return None
     try:
@@ -43,6 +38,19 @@ def _valid_ask(ask: float | None) -> float | None:
     except Exception:
         return None
     if not math.isfinite(value) or value <= 0 or value > 1.0:
+        return None
+    return value
+
+
+def _valid_bid(bid: float | None) -> float | None:
+    """Strict bid validation; zero is a legal bid, None/NA is not."""
+    if bid is None:
+        return None
+    try:
+        value = float(bid)
+    except Exception:
+        return None
+    if not math.isfinite(value) or value < 0 or value > 1.0:
         return None
     return value
 
@@ -60,14 +68,12 @@ class V6Params:
     hard_max_quote_staleness_s: float = 60.0
     max_slippage_cents: float = 2.0
     debug: bool = True
-    force_trade_test: bool = False
 
     @classmethod
     def from_config(cls, cfg: dict) -> "V6Params":
         strategy_cfg = (
             cfg.get("strategy", {}) if isinstance(cfg.get("strategy", {}), dict) else {}
         )
-        value = strategy_cfg.get("force_trade_test", cfg.get("force_trade_test", False))
         return cls(
             entry_t_minus_s=float(strategy_cfg.get("entry_t_minus_s", 240.0)),
             move_threshold=float(strategy_cfg.get("move_threshold", 0.20)),
@@ -84,7 +90,6 @@ class V6Params:
             ),
             max_slippage_cents=float(strategy_cfg.get("max_slippage_cents", 2.0)),
             debug=bool(strategy_cfg.get("debug", True)),
-            force_trade_test=bool(value),
         )
 
 
@@ -277,7 +282,7 @@ class V6Strategy:
             return None
 
         # Hard readiness gate: never compute indicators or emit a Signal
-        # from a missing/not-ready order book, including force_trade_test.
+        # from a missing/not-ready order book.
         if up_book is None or down_book is None:
             self._gate("book missing", now_ms)
             return None
@@ -287,73 +292,71 @@ class V6Strategy:
             self._gate("up_ready/down_ready false", now_ms)
             return None
 
-        # Hard 60s dead-book gate.  This MUST run before force_trade_test:
-        # force mode is for plumbing tests, not for filling 3-minute-old books.
+        # HARD DATA GATE: this is deliberately before every indicator
+        # calculation.  A missing/NA price must never reach the move, OFI, or
+        # order path; there is no escape hatch.
+        spot_open_f = _number(spot_open)
+        spot_now_f = _number(spot_now)
+        if (
+            spot_open_f is None
+            or spot_now_f is None
+            or spot_open_f <= 0
+            or spot_now_f <= 0
+        ):
+            self._gate(
+                f"DATA spot_open={spot_open!r} spot_now={spot_now!r}", now_ms
+            )
+            return None
+
+        up_bid = _valid_bid(up_book.best_bid)
+        up_ask = _valid_ask(up_book.best_ask)
+        down_bid = _valid_bid(down_book.best_bid)
+        down_ask = _valid_ask(down_book.best_ask)
+        missing = [
+            name
+            for name, value in (
+                ("up_bid", up_bid),
+                ("up_ask", up_ask),
+                ("down_bid", down_bid),
+                ("down_ask", down_ask),
+            )
+            if value is None
+        ]
+        if missing:
+            self._gate(
+                f"DATA missing={','.join(missing)} "
+                f"up={up_book.best_bid!r}/{up_book.best_ask!r} "
+                f"down={down_book.best_bid!r}/{down_book.best_ask!r}",
+                now_ms,
+            )
+            return None
+        if up_bid > up_ask or down_bid > down_ask:
+            self._gate(
+                f"DATA crossed book up={up_bid:.4f}/{up_ask:.4f} "
+                f"down={down_bid:.4f}/{down_ask:.4f}",
+                now_ms,
+            )
+            return None
+
+        up_mid_open_f = _number(up_mid_open)
+        up_mid = _number(up_book.mid)
+        down_mid = _number(down_book.mid)
+        if up_mid_open_f is None or up_mid is None or down_mid is None:
+            self._gate(
+                f"DATA mids up_open={up_mid_open!r} up={up_book.mid!r} "
+                f"down={down_book.mid!r}",
+                now_ms,
+            )
+            return None
+
+        # Hard 60s dead-book gate.  Any older book is not a tradeable market,
+        # even if its top-of-book fields happen to parse.
         for label, book in (("up", up_book), ("down", down_book)):
             ts = int(getattr(book, "last_update_ms", 0) or 0)
             age_ms = now_ms - ts
             if ts <= 0 or age_ms > self.p.hard_max_quote_staleness_s * 1000:
                 self._gate(f"HARD {label} quote stale {age_ms}ms", now_ms)
                 return None
-
-        # 强制测试模式：优先，且绕过普通 2s 新鲜度门槛（但绝不绕过上面的 60s 死盘门槛）
-        if self.p.force_trade_test:
-            up_ask = _valid_ask(up_book.best_ask)
-            down_ask = _valid_ask(down_book.best_ask)
-            if up_ask is None and down_ask is None:
-                print(f"[Error] 价格无效 market={market.slug} ask=None both sides", flush=True)
-                return None
-            if up_ask is not None and down_ask is not None:
-                side = "UP" if up_ask <= down_ask else "DOWN"
-                ask = up_ask if side == "UP" else down_ask
-            elif up_ask is not None:
-                side = "UP"
-                ask = up_ask
-            else:
-                side = "DOWN"
-                ask = down_ask
-
-            ask = _valid_ask(ask)
-            if ask is None or ask <= 0:
-                print(
-                    f"[Error] 拦截坏单: market={market.slug} force_trade_test bad ask={ask!r}",
-                    flush=True,
-                )
-                return None
-
-            book = up_book if side == "UP" else down_book
-            bid = _number(book.best_bid)
-            spread = (ask - bid) if bid is not None else 0.0
-            ask_levels = _ask_ladder(book)
-            print(
-                f"[Strategy][ForceTrade] market={market.slug} side={side} "
-                f"ask={ask} bid={bid} spread={spread} secs={secs:.2f}",
-                flush=True,
-            )
-            return Signal(
-                market=market,
-                side=side,
-                move=0.0,
-                imbalance=0.0,
-                spot_move=0.0,
-                ask=float(ask),
-                bid=float(bid) if bid is not None else 0.0,
-                spread=float(spread),
-                secs_to_close=secs,
-                reason="force_trade_test",
-                ask_size=ask_levels[0][1] if ask_levels else 0.0,
-                ask_levels=ask_levels,
-            )
-
-        if up_mid_open is None:
-            return None
-        up_mid_open_f = _number(up_mid_open)
-        if up_mid_open_f is None:
-            return None
-        up_mid = _number(up_book.mid)
-        down_mid = _number(down_book.mid)
-        if up_mid is None or down_mid is None:
-            return None
 
         # `move` is the Up-token mid probability change, in the same units as
         # strategy.move_threshold (0.20 means 20 cents on a 0..1 token).
@@ -365,21 +368,10 @@ class V6Strategy:
             move = precomputed_move_f
         move = float(move)
 
-        spot_open_f = _number(spot_open)
-        spot_now_f = _number(spot_now)
         # `spot_move` is a separate fractional BTC return used by the spot
         # gate. Never substitute raw BTC price for the token-probability move:
         # 79662.005 - 79662.005 is not comparable to move_threshold=0.20.
-        spot_move = (
-            None
-            if (
-                spot_open_f is None
-                or spot_now_f is None
-                or spot_open_f <= 0
-                or spot_now_f <= 0
-            )
-            else float((spot_now_f - spot_open_f) / spot_open_f)
-        )
+        spot_move = float((spot_now_f - spot_open_f) / spot_open_f)
         imbalance = float(
             _imbalance(up_book, self.p.imbalance_depth)
             - _imbalance(down_book, self.p.imbalance_depth)
@@ -397,20 +389,14 @@ class V6Strategy:
                 self._gate(f"{label} quote stale {now_ms - ts}ms", now_ms)
                 return None
 
-        ask_up = _valid_ask(up_book.best_ask)
-        ask_down = _valid_ask(down_book.best_ask)
-        if ask_up is None and ask_down is None:
-            print(f"[Error] 价格无效 market={market.slug} ask=None both sides", flush=True)
-            return None
-
         if move >= self.p.move_threshold and imbalance >= self.p.min_book_imbalance:
             side = "UP"
-            ask = ask_up
-            bid = _number(up_book.best_bid)
+            ask = up_ask
+            bid = up_bid
         elif move <= -self.p.move_threshold and imbalance <= -self.p.min_book_imbalance:
             side = "DOWN"
-            ask = ask_down
-            bid = _number(down_book.best_bid)
+            ask = down_ask
+            bid = down_bid
         else:
             spot_now_txt = f"{spot_now_f:.3f}" if spot_now_f is not None else "NA"
             spot_open_txt = f"{spot_open_f:.3f}" if spot_open_f is not None else "NA"
