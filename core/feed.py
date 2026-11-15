@@ -1128,6 +1128,13 @@ class MarketDiscovery:
         return slug, bucket
 
     def _json_list(self, value: Any) -> list[Any]:
+        """Decode Gamma's JSON-in-a-JSON-string fields.
+
+        Gamma returns ``outcomePrices`` as a *string* such as
+        ``"[\"1\", \"0\"]"`` (and sometimes double-encoded).  A naive
+        ``outcomePrices[0]`` reads the first character, so always decode
+        strings first, then validate the decoded shape.
+        """
         if value is None:
             return []
         if isinstance(value, list):
@@ -1135,13 +1142,19 @@ class MarketDiscovery:
         if isinstance(value, tuple):
             return list(value)
         if isinstance(value, str):
-            try:
-                parsed = json.loads(value)
+            current: Any = value
+            for _ in range(3):
+                try:
+                    parsed = json.loads(current)
+                except Exception:
+                    return [current]
                 if isinstance(parsed, list):
                     return parsed
-            except Exception:
-                pass
-            return [value]
+                if isinstance(parsed, str) and parsed != current:
+                    current = parsed
+                    continue
+                return [parsed]
+            return [current]
         if isinstance(value, dict):
             return [value]
         return [value]
@@ -1166,8 +1179,22 @@ class MarketDiscovery:
                 "Accept": "application/json",
             },
         )
-        with urllib.request.urlopen(req, timeout=self.timeout if timeout is None else timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout if timeout is None else timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")[:2000]
+            except Exception:  # noqa: BLE001
+                pass
+            LOG.error(
+                "[HTTP] %s status=%s body=%s",
+                url,
+                exc.code,
+                body or "<empty>",
+            )
+            raise
 
     def discover(self, slug: str, retries: int = 3, timeout: float = 15.0) -> Market | None:
         last_exc: Exception | None = None
