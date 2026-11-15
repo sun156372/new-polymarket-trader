@@ -6,6 +6,7 @@ exact confirmation phrase. The private key is read from os.getenv only.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -384,28 +385,110 @@ class LiveExecutor(BaseExecutor):
         if not key:
             raise RuntimeError(f"LIVE blocked: environment variable {key_env} is not set")
 
+        # Never hand-roll CLOB HMAC.  The official client owns request
+        # canonicalisation and L2 signing; reimplementing it is exactly how
+        # double-encoded 401s get introduced.
+        try:
+            from importlib.metadata import version as _pkg_version
+
+            sdk_version = _pkg_version("py-clob-client")
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "LIVE blocked: install the official `py-clob-client` "
+                "(>=0.34.6); it is not installed"
+            ) from exc
+        try:
+            from packaging.version import Version
+
+            if Version(sdk_version) < Version("0.34.6"):
+                raise RuntimeError(
+                    "LIVE blocked: py-clob-client "
+                    f"{sdk_version} is too old; upgrade to >=0.34.6 "
+                    "(older releases contain the L2/HMAC 401 bug)"
+                )
+        except ImportError:
+            # packaging is normally a transitive dependency; do not make the
+            # live client unusable just because the helper is absent.
+            LOG.warning("packaging is unavailable; cannot verify py-clob-client version")
+
         try:
             from py_clob_client.client import ClobClient
             from py_clob_client.clob_types import ApiCreds
-        except Exception:
-            try:
-                from py_clob_client_v2.client import ClobClient  # type: ignore
-                from py_clob_client_v2.clob_types import ApiCreds  # type: ignore
-            except Exception as exc:  # noqa: BLE001
-                raise RuntimeError("LIVE blocked: py-clob-client is not installed") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "LIVE blocked: official `py-clob-client` import failed"
+            ) from exc
+
+        api_key_env = self.cfg.get("polymarket", {}).get(
+            "api_key_env", "POLYMARKET_CLOB_API_KEY"
+        )
+        secret_env = self.cfg.get("polymarket", {}).get(
+            "api_secret_env", "POLYMARKET_CLOB_API_SECRET"
+        )
+        passphrase_env = self.cfg.get("polymarket", {}).get(
+            "api_passphrase_env", "POLYMARKET_CLOB_API_PASSPHRASE"
+        )
+        api_key = os.getenv(api_key_env, "").strip()
+        api_secret = os.getenv(secret_env, "").strip()
+        api_passphrase = os.getenv(passphrase_env, "").strip()
+        missing = [
+            name
+            for name, value in (
+                (api_key_env, api_key),
+                (secret_env, api_secret),
+                (passphrase_env, api_passphrase),
+            )
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(
+                "LIVE blocked: missing CLOB L2 credentials: "
+                + ", ".join(missing)
+                + ". Create them via the CLOB /auth/api-key flow and set "
+                "POLYMARKET_CLOB_API_KEY/SECRET/PASSPHRASE."
+            )
 
         host = self.cfg.get("polymarket", {}).get("clob_host", "https://clob.polymarket.com")
         chain_id = int(self.cfg.get("polymarket", {}).get("chain_id", 137))
         sig_type = int(self.cfg.get("polymarket", {}).get("signature_type", 0))
         funder = os.getenv(self.cfg.get("polymarket", {}).get("funder_env", "POLYMARKET_FUNDER")) or None
-        client = ClobClient(host, key=key, chain_id=chain_id, signature_type=sig_type, funder=funder)
-        try:
-            creds = client.create_or_derive_api_creds()
-            client.set_api_creds(creds)
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("could not derive API creds at startup: %s", exc)
+        client = ClobClient(
+            host,
+            key=key,
+            chain_id=chain_id,
+            signature_type=sig_type,
+            funder=funder,
+        )
+        client.set_api_creds(
+            ApiCreds(
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_passphrase,
+            )
+        )
         self._client = client
-        LOG.info("LIVE CLOB client initialized (chain_id=%s signature_type=%s)", chain_id, sig_type)
+        LOG.info(
+            "LIVE CLOB client initialized (sdk=%s chain_id=%s signature_type=%s "
+            "api_key=%s...)",
+            sdk_version,
+            chain_id,
+            sig_type,
+            api_key[:6],
+        )
+
+    @staticmethod
+    def _order_error_detail(exc: BaseException) -> str:
+        response = getattr(exc, "response", None)
+        status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+        body: Any = getattr(exc, "body", None)
+        if body is None and response is not None:
+            try:
+                body = response.text
+            except Exception:  # noqa: BLE001
+                body = None
+        if body is None:
+            body = getattr(exc, "args", None)
+        return f"status={status!r} body={body!r} exc={type(exc).__name__}: {exc}"
 
     def buy(self, signal: Signal, stake_usdc: float) -> Fill:
         ask = _coerce_valid_ask(signal)
@@ -414,16 +497,35 @@ class LiveExecutor(BaseExecutor):
         token_id = signal.market.up_token if signal.side == "UP" else signal.market.down_token
         try:
             from py_clob_client.clob_types import MarketOrderArgs, OrderType
-        except Exception:
-            from py_clob_client_v2.clob_types import MarketOrderArgs, OrderType  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("LIVE blocked: py-clob-client order types unavailable") from exc
 
-        args = MarketOrderArgs(token_id=token_id, amount=float(stake_usdc), side="BUY",
-                               order_type=OrderType.FOK)
-        signed = self._client.create_market_order(args)
-        resp = self._client.post_order(signed, OrderType.FOK)
+        args = MarketOrderArgs(
+            token_id=token_id,
+            amount=float(stake_usdc),
+            side="BUY",
+            order_type=OrderType.FOK,
+        )
+        try:
+            signed = self._client.create_market_order(args)
+            resp = self._client.post_order(signed, OrderType.FOK)
+        except Exception as exc:  # noqa: BLE001
+            detail = self._order_error_detail(exc)
+            LOG.error("[LIVE] POST /order failed %s", detail)
+            print(f"[LIVE ERROR] POST /order failed {detail}", flush=True)
+            raise
+
         if not isinstance(resp, dict):
+            LOG.error("[LIVE] unexpected POST /order response: %r", resp)
             raise RuntimeError(f"unexpected CLOB response: {resp!r}")
-        if str(resp.get("status", "")).lower() not in ("matched", "filled", "success"):
+        if resp.get("error") or str(resp.get("status", "")).lower() not in (
+            "matched",
+            "filled",
+            "success",
+        ):
+            detail = json.dumps(resp, ensure_ascii=False, default=str)
+            LOG.error("[LIVE] POST /order rejected: %s", detail)
+            print(f"[LIVE ERROR] POST /order rejected: {detail}", flush=True)
             raise RuntimeError(f"order not filled: {resp}")
         taking = float(resp.get("takingAmount") or 0.0)
         making = float(resp.get("makingAmount") or 0.0)
