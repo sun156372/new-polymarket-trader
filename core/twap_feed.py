@@ -43,6 +43,7 @@ DEFAULT_WS_URL = "wss://ws-live-v2.polymarket.com/ws"
 DEFAULT_TOPIC = "price.crypto.twap"
 DEFAULT_SYMBOL = "btcusd"
 DEFAULT_WINDOW_SECONDS = 60
+NO_DATA_WARNING_SECONDS = 30.0
 DEFAULT_REST_URL = ""
 AUTH_RID = "a1"
 SUBSCRIBE_RID = "s1"
@@ -155,7 +156,7 @@ class ChainlinkTwapFeed:
         self.ws_url = str(ws_url)
         self.topic = str(topic)
         self.symbol = _normalise_symbol(symbol)
-        self.window_seconds = int(window_seconds)
+        self.window_seconds = DEFAULT_WINDOW_SECONDS
         self.stale_after_ms = max(1_000, int(float(stale_after_s) * 1000))
         self.open_tolerance_ms = max(1_000, int(open_tolerance_ms))
         self.close_tolerance_ms = max(1_000, int(close_tolerance_ms))
@@ -538,18 +539,19 @@ class ChainlinkTwapFeed:
                 if (
                     not warned_no_data
                     and connection_accepted == 0
-                    and _now_ms() - subscribed_ms >= 10_000
+                    and _now_ms() - subscribed_ms >= NO_DATA_WARNING_SECONDS * 1000
                 ):
                     warned_no_data = True
                     print(
-                        "[TWAP WARNING] 10s 未收到 TWAP 数据 "
+                        "[TWAP WARNING] 30s 未收到 TWAP 数据 "
                         f"url={self.ws_url} channel={self.topic} "
                         f"symbol={self.symbol!r} window={self.window_seconds}s; "
-                        "检查 channel/symbol/auth（PolyBolt 需要 CLOB API 凭证）",
+                        "空 snapshot 不算数据；检查 channel/symbol/auth "
+                        "（PolyBolt 需要 CLOB API 凭证）",
                         flush=True,
                     )
                     LOG.warning(
-                        "[TWAP] no data 10s after subscribe channel=%s symbol=%s",
+                        "[TWAP] no data 30s after subscribe channel=%s symbol=%s",
                         self.topic,
                         self.symbol,
                     )
@@ -604,6 +606,19 @@ class ChainlinkTwapFeed:
                 continue
             if not isinstance(node, dict):
                 continue
+
+            # PolyBolt snapshots are often {"snapshot":true,"payload":
+            # {"data":[]}}.  They are metadata, not a price tick: never let
+            # an empty data array update memory or reset the no-data timer.
+            data_items = node.get("data")
+            if isinstance(data_items, list):
+                if not data_items:
+                    continue
+                for item in data_items:
+                    if isinstance(item, dict) and self._has_quote_value(item):
+                        stack.append(item)
+                continue
+
             tick = self._parse_tick(node)
             if tick is not None:
                 accepted += 1
@@ -613,6 +628,16 @@ class ChainlinkTwapFeed:
                 if isinstance(child, (dict, list)):
                     stack.append(child)
         return accepted
+
+    @staticmethod
+    def _has_quote_value(node: dict[str, Any]) -> bool:
+        """True only for a real quote leaf, not an empty snapshot header."""
+        raw = (
+            node.get("full_accuracy_value")
+            or node.get("fullAccuracyValue")
+            or node.get("value")
+        )
+        return raw is not None and str(raw).strip() != ""
 
     def _parse_tick(
         self,
